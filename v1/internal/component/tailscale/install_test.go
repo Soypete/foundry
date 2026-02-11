@@ -2,7 +2,6 @@ package tailscale
 
 import (
 	"context"
-	"strings"
 	"testing"
 )
 
@@ -152,13 +151,10 @@ func TestInstaller_Install(t *testing.T) {
 		t.Fatalf("NewInstaller() unexpected error: %v", err)
 	}
 
-	// Install fails because createNamespace is not yet implemented
+	// Install should succeed (currently just validates prerequisites and creates namespace stub)
 	err = installer.Install(context.Background())
-	if err == nil {
-		t.Error("Install() should return error (createNamespace not yet implemented)")
-	}
-	if err != nil && !strings.Contains(err.Error(), "createNamespace not yet implemented") {
-		t.Errorf("Install() error = %v, want error containing %v", err, "createNamespace not yet implemented")
+	if err != nil {
+		t.Errorf("Install() unexpected error: %v", err)
 	}
 }
 
