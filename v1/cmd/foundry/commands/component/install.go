@@ -23,6 +23,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/prometheus"
 	"github.com/catalystcommunity/foundry/v1/internal/component/seaweedfs"
 	componentStorage "github.com/catalystcommunity/foundry/v1/internal/component/storage"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/component/velero"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/dashboards"
@@ -116,6 +117,7 @@ var k8sComponents = map[string]bool{
 	"external-dns":       true,
 	"velero":             true,
 	"openbao-injector":   true,
+	"tailscale":          true,
 }
 
 func runInstall(ctx context.Context, cmd *cli.Command) error {
@@ -363,6 +365,47 @@ func installK8sComponent(ctx context.Context, cmd *cli.Command, name string, sta
 			return fmt.Errorf("failed to create OpenBAO client: %w", err)
 		}
 		componentWithClients = openbaoinjector.NewComponent(helmClient, k8sClient, openbaoClient)
+	case "tailscale":
+		// Tailscale needs the cluster VIP (advertised as a subnet route) and the
+		// operator's OAuth credentials. The credentials are typically stored as
+		// ${secret:...} references in the stack config and resolved from OpenBAO
+		// at install time so the real values never live in stack.yaml.
+		vip := stackConfig.Cluster.VIP
+		if vip == "" {
+			return fmt.Errorf("tailscale requires cluster.vip to be set")
+		}
+
+		tsConfig := &tailscale.Config{}
+		if comp, ok := stackConfig.Components["tailscale"]; ok {
+			resolver, resCtx, rerr := buildSecretResolver(stackConfig)
+			if rerr != nil {
+				return fmt.Errorf("failed to set up secret resolver for tailscale: %w", rerr)
+			}
+			if id, ok := comp.Config["oauth_client_id"].(string); ok && id != "" {
+				resolved, err := resolveSecretString(id, resolver, resCtx)
+				if err != nil {
+					return fmt.Errorf("failed to resolve oauth_client_id: %w", err)
+				}
+				tsConfig.OAuthClientID = &resolved
+			}
+			if secretVal, ok := comp.Config["oauth_client_secret"].(string); ok && secretVal != "" {
+				resolved, err := resolveSecretString(secretVal, resolver, resCtx)
+				if err != nil {
+					return fmt.Errorf("failed to resolve oauth_client_secret: %w", err)
+				}
+				tsConfig.OAuthClientSecret = &resolved
+			}
+			if img, ok := comp.Config["operator_image"].(string); ok && img != "" {
+				tsConfig.OperatorImage = &img
+			}
+			if tags, ok := toStringSlice(comp.Config["tags"]); ok {
+				tsConfig.Tags = tags
+			}
+			if routes, ok := toStringSlice(comp.Config["advertise_routes"]); ok {
+				tsConfig.AdvertiseRoutes = routes
+			}
+		}
+		componentWithClients = tailscale.NewComponentWithClients(tsConfig, vip, helmClient, k8sClient)
 	default:
 		return fmt.Errorf("unknown kubernetes component: %s", name)
 	}
@@ -424,6 +467,42 @@ func resolveSecretRefs(v interface{}, resolver *secrets.ChainResolver, resCtx *s
 		}
 	}
 	return nil
+}
+
+// resolveSecretString resolves a single ${secret:path:key} reference to its
+// value. Plain (non-reference) strings are returned unchanged, so callers can
+// pass either a literal or a reference. Used for the Tailscale OAuth
+// credentials, which must never be persisted in stack.yaml.
+func resolveSecretString(s string, resolver *secrets.ChainResolver, resCtx *secrets.ResolutionContext) (string, error) {
+	ref, err := secrets.ParseSecretRef(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid secret reference %q: %w", s, err)
+	}
+	if ref == nil {
+		return s, nil // not a secret reference; use the literal value
+	}
+	return resolver.Resolve(resCtx, *ref)
+}
+
+// toStringSlice coerces a stack-config value (which may be []string or the
+// []interface{} produced by YAML decoding) into a []string.
+func toStringSlice(v interface{}) ([]string, bool) {
+	switch t := v.(type) {
+	case []string:
+		return t, true
+	case []interface{}:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, s)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
 }
 
 // syncGrafanaDashboards seeds the bundled default dashboards into the stack's
