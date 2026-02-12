@@ -27,6 +27,7 @@ func TestInitComponents(t *testing.T) {
 		"dns",
 		"zot",
 		"k3s",
+		"tailscale",
 		"gateway-api",
 		"contour",
 		"gateway-controller",
