@@ -53,20 +53,33 @@ Your Tailscale ACL must allow:
 
 ## Configuration
 
-### Single Control Plane Setup
+### VIP Requirements
 
-For single control plane deployments, use a dedicated VIP address that is routable via Tailscale:
+**IMPORTANT:** The VIP must always be a separate, dedicated IP address that is not assigned to any host. This is required because kube-vip manages the VIP through ARP advertisements, and having the VIP match a host's actual IP can cause network conflicts and packet loss.
+
+For Tailscale deployments, use a CGNAT IP in the 100.64.0.0/10 range that:
+- Is NOT assigned to any of your cluster nodes
+- Is within your Tailscale network's IP range
+- Will be advertised as a subnet route by the Tailscale operator
+
+### Setup Steps
+
+For both single and multi-control-plane setups, the process is the same:
+
+#### Step 1: Configure Foundry with a Dedicated VIP
+
+Choose a CGNAT IP for your VIP that is NOT assigned to any node:
 
 ```yaml
 cluster:
   name: my-cluster
   primary_domain: example.local
-  vip: 100.81.89.100  # Dedicated VIP (not assigned to any host)
+  vip: 100.81.89.100  # Dedicated VIP (not a node IP!)
   allow_cgnat_vip: true
 
 hosts:
   - hostname: control-plane
-    address: 100.81.89.62  # Control plane's Tailscale IP
+    address: 100.81.89.62  # Different from VIP
     user: root
   - hostname: worker-1
     address: 100.70.90.12
@@ -76,48 +89,63 @@ hosts:
     user: root
 ```
 
-**Important:** The VIP must be different from any host's IP address. You must advertise the VIP as a subnet route from the control plane:
+#### Step 2: Deploy the Cluster
+
+Run Foundry to deploy K3s and kube-vip:
 
 ```bash
-# On the control plane node
-tailscale up --advertise-routes=100.81.89.100/32
+foundry stack install
 ```
 
-Then approve the route in the Tailscale admin console.
+#### Step 3: Install Tailscale Operator
 
-### High Availability (Multi-Control-Plane) Setup
-
-For HA setups with multiple control planes, you need to make the VIP routable via Tailscale:
-
-#### Option 1: Tailscale Subnet Routes
-
-Advertise the VIP as a subnet route from the active control plane:
+After the cluster is running, install the Tailscale operator to manage subnet route advertisements:
 
 ```bash
-# On the control plane node
-tailscale up --advertise-routes=100.81.89.100/32
+# Add Tailscale Helm repository
+helm repo add tailscale https://pkgs.tailscale.com/helmcharts
+helm repo update
+
+# Install the operator
+helm install tailscale-operator tailscale/tailscale-operator \
+  --namespace=tailscale \
+  --create-namespace \
+  --set-string oauth.clientId=${TS_OAUTH_CLIENT_ID} \
+  --set-string oauth.clientSecret=${TS_OAUTH_CLIENT_SECRET} \
+  --wait
 ```
 
-Then approve the route in the Tailscale admin console.
+**Prerequisites:**
+- Create OAuth credentials in Tailscale admin console: https://tailscale.com/kb/1236/kubernetes-operator
+- Set environment variables `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_CLIENT_SECRET`
+
+#### Step 4: Configure ProxyClass for VIP Route
+
+Create a ProxyClass to advertise the VIP as a subnet route:
 
 ```yaml
-cluster:
-  name: my-cluster
-  primary_domain: example.local
-  vip: 100.81.89.100  # Dedicated VIP
-  allow_cgnat_vip: true
+apiVersion: tailscale.com/v1alpha1
+kind: ProxyClass
+metadata:
+  name: vip-advertiser
+spec:
+  statefulSet:
+    labels:
+      tailscale-vip: "true"
+    pod:
+      tailscaleContainer:
+        env:
+          - name: TS_ROUTES
+            value: "100.81.89.100/32"
 ```
 
-**Note:** kube-vip will manage the VIP assignment, but you need to ensure the route is advertised from whichever node currently holds the VIP.
+Apply it:
 
-#### Option 2: Tailscale Operator (Recommended for HA)
+```bash
+kubectl apply -f proxyclass.yaml
+```
 
-The Tailscale Operator integration will be available in a future Foundry release. This will provide:
-- Automatic operator installation on control planes
-- Automated VIP subnet route management
-- Support for cross-pod network policies via Tailscale ACLs
-
-For now, use Option 1 (Subnet Routes) for HA setups.
+This will automatically advertise your VIP subnet route to Tailscale, making it reachable from all nodes.
 
 ## Network Routing Considerations
 
@@ -133,13 +161,11 @@ Traditional kube-vip assumes Layer 2 networking where the VIP can "float" betwee
 
 For worker nodes to reach the VIP:
 
-**Single control plane:**
-- VIP = control plane IP → Always routable (it's the node's primary IP)
-
-**Multiple control planes:**
-- VIP = dedicated IP → Must be advertised as subnet route
-- Route must be updated when VIP moves between control planes
-- Tailscale operator can automate this
+**All deployments (single or multi-control-plane):**
+- VIP must be a dedicated IP, separate from any node's IP
+- VIP must be advertised as a subnet route via Tailscale
+- Tailscale operator automates route management as VIP moves between nodes
+- kube-vip handles VIP assignment and failover via ARP (local to each node)
 
 ## Troubleshooting
 
@@ -162,8 +188,9 @@ curl -k https://<VIP>:6443/version --max-time 5
 ```
 
 **Solution:**
-- Single control plane: Advertise VIP as subnet route from control plane
-- Multi control plane: Advertise VIP as subnet route from active control plane
+- Ensure VIP is advertised as a subnet route via Tailscale operator
+- Verify ProxyClass is configured correctly with the VIP route
+- Check that the route is approved in Tailscale admin console
 
 ### SSH Connection Refused Between Nodes
 
@@ -189,10 +216,16 @@ VIP is assigned to the local interface but not advertised to Tailscale.
 
 **Solution:**
 ```bash
-# On control plane
-tailscale up --advertise-routes=<VIP>/32
+# Check if Tailscale operator is running
+kubectl get pods -n tailscale
 
-# Then approve in Tailscale admin console
+# Check if ProxyClass is configured
+kubectl get proxyclass
+
+# Verify the route is being advertised
+kubectl logs -n tailscale -l tailscale-vip=true
+
+# If operator is not installed, install it following Step 3 above
 ```
 
 ## Validation Checklist
@@ -211,10 +244,10 @@ Before deploying:
 
 Future enhancements planned for Tailscale integration:
 
-1. **Tailscale Operator Integration**
-   - Automatic operator installation on control planes
-   - Automated VIP subnet route management
-   - Support for cross-pod network policies via Tailscale ACLs
+1. **Automated Tailscale Operator Installation**
+   - Automatic operator installation during cluster setup
+   - Auto-generated OAuth credentials integration
+   - Automated ProxyClass configuration
 
 2. **Multi-Cluster Mesh**
    - Connect multiple Foundry clusters via Tailscale

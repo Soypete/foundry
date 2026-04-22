@@ -212,8 +212,9 @@ func TestDetermineVIPConfig(t *testing.T) {
 				}
 			},
 			want: &VIPConfig{
-				VIP:       "192.168.1.100",
-				Interface: "eth0",
+				VIP:           "192.168.1.100",
+				Interface:     "eth0",
+				AllowCGNATVIP: func() *bool { v := false; return &v }(),
 			},
 			wantErr: false,
 		},
@@ -517,6 +518,89 @@ func TestFormatManifests(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := FormatManifests(tt.manifests...)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestValidateVIPWithCGNAT tests CGNAT VIP validation (RFC6598 - 100.64.0.0/10)
+func TestValidateVIPWithCGNAT(t *testing.T) {
+	tests := []struct {
+		name       string
+		vip        string
+		allowCGNAT bool
+		wantErr    bool
+		errMsg     string
+	}{
+		{
+			name:       "valid CGNAT IP - lower bound",
+			vip:        "100.64.0.0",
+			allowCGNAT: true,
+			wantErr:    false,
+		},
+		{
+			name:       "valid CGNAT IP - middle of range",
+			vip:        "100.127.255.255",
+			allowCGNAT: true,
+			wantErr:    false,
+		},
+		{
+			name:       "valid CGNAT IP - upper bound",
+			vip:        "100.127.255.255",
+			allowCGNAT: true,
+			wantErr:    false,
+		},
+		{
+			name:       "CGNAT IP rejected without flag",
+			vip:        "100.64.0.0",
+			allowCGNAT: false,
+			wantErr:    true,
+			errMsg:     "should be a private IP",
+		},
+		{
+			name:       "CGNAT IP rejected without flag - upper range",
+			vip:        "100.127.255.255",
+			allowCGNAT: false,
+			wantErr:    true,
+			errMsg:     "should be a private IP",
+		},
+		{
+			name:       "CGNAT IP just outside range - below",
+			vip:        "100.63.255.255",
+			allowCGNAT: false,
+			wantErr:    true,
+			errMsg:     "should be a private IP",
+		},
+		{
+			name:       "CGNAT IP just outside range - above",
+			vip:        "100.128.0.0",
+			allowCGNAT: false,
+			wantErr:    true,
+			errMsg:     "should be a private IP",
+		},
+		{
+			name:       "Tailscale common IP",
+			vip:        "100.101.102.103",
+			allowCGNAT: true,
+			wantErr:    false,
+		},
+		{
+			name:       "Tailscale common IP rejected without flag",
+			vip:        "100.101.102.103",
+			allowCGNAT: false,
+			wantErr:    true,
+			errMsg:     "should be a private IP",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateVIP(tt.vip, tt.allowCGNAT)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errMsg)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
