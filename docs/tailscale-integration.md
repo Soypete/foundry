@@ -55,7 +55,7 @@ Your Tailscale ACL must allow:
 
 ### VIP Requirements
 
-**IMPORTANT:** The VIP must always be a separate, dedicated IP address that is not assigned to any host. This is required because kube-vip manages the VIP through ARP advertisements, and having the VIP match a host's actual IP can cause network conflicts and packet loss.
+**IMPORTANT:** The VIP must always be a separate, dedicated IP address that is not assigned to any host. This is required because kube-vip manages the VIP through ARP advertisements, and having the VIP match a host's actual IP can cause network conflicts and packet loss. Foundry enforces this: `allow_cgnat_vip` widens the accepted range to CGNAT, but the VIP still may not equal any host's address.
 
 For Tailscale deployments, use a CGNAT IP in the 100.64.0.0/10 range that:
 - Is NOT assigned to any of your cluster nodes
@@ -64,7 +64,7 @@ For Tailscale deployments, use a CGNAT IP in the 100.64.0.0/10 range that:
 
 ### Setup Steps
 
-For both single and multi-control-plane setups, the process is the same:
+For both single and multi-control-plane setups, the process is the same.
 
 #### Step 1: Configure Foundry with a Dedicated VIP
 
@@ -74,7 +74,7 @@ Choose a CGNAT IP for your VIP that is NOT assigned to any node:
 cluster:
   name: my-cluster
   primary_domain: example.local
-  vip: 100.81.89.100  # Dedicated VIP (not a node IP!)
+  vip: 100.81.89.100  # Dedicated VIP (not assigned to any host)
   allow_cgnat_vip: true
 
 hosts:
@@ -258,6 +258,23 @@ Future enhancements planned for Tailscale integration:
    - Version control for network policies
    - CI/CD automation for ACL updates
    - Integration with Foundry stack management
+
+## Testing (local)
+
+The CGNAT VIP validation added here is covered by unit tests and needs no
+cluster. From the repo root:
+
+```bash
+# Build, vet, and run all unit tests (excludes the Docker integration suite)
+scripts/test-local.sh
+
+# Just the VIP / k3s validation this PR touches
+PKG=./internal/component/k3s/... scripts/test-local.sh
+```
+
+`scripts/test-local.sh --kind` spins up a throwaway kind cluster; later PRs in
+the Tailscale stack use it to dry-run-apply their generated manifests against a
+live API server. See `scripts/README.md` for all modes.
 
 ## References
 
