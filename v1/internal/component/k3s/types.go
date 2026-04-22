@@ -64,6 +64,11 @@ func ParseConfig(cfg component.ComponentConfig) (*Config, error) {
 		config.VIP = vip
 	}
 
+	// Allow CGNAT VIP
+	if allowCGNAT, ok := cfg.GetBool("allow_cgnat_vip"); ok {
+		config.AllowCGNATVIP = &allowCGNAT
+	}
+
 	// Interface
 	if iface, ok := cfg.GetString("interface"); ok {
 		config.Interface = iface
@@ -194,7 +199,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("VIP is required")
 	}
 
-	if err := ValidateVIP(c.VIP); err != nil {
+	// Dereference AllowCGNATVIP pointer (defaults to false if nil)
+	allowCGNAT := c.AllowCGNATVIP != nil && *c.AllowCGNATVIP
+	if err := ValidateVIP(c.VIP, allowCGNAT); err != nil {
 		return fmt.Errorf("VIP validation failed: %w", err)
 	}
 
