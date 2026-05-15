@@ -256,7 +256,9 @@ func addNodeToCluster(ctx context.Context, hostname string, nodeRole *k3s.Determ
 	defer conn.Close()
 
 	// Step 4: Build K3s config
-	serverURL := fmt.Sprintf("https://%s:6443", cfg.Cluster.VIP)
+	// Use control plane's address (first host with cluster-control-plane role) for remote access
+	controlPlaneAddress := getControlPlaneAddress(cfg)
+	serverURL := fmt.Sprintf("https://%s:6443", controlPlaneAddress)
 	k3sConfig := &k3s.Config{
 		ClusterInit:  false,
 		ServerURL:    serverURL,
@@ -441,4 +443,19 @@ func updateLonghornReplicaSetting(ctx context.Context, client *k8s.Client, repli
 
 	fmt.Printf("Updated Longhorn default replica count from %d to %d\n", currentReplicas, replicaCount)
 	return nil
+}
+
+// getControlPlaneAddress returns the address of the first control plane node
+// Falls back to VIP if no control plane host is found
+func getControlPlaneAddress(cfg *config.Config) string {
+	clusterHosts := cfg.GetClusterHosts()
+	for _, h := range clusterHosts {
+		for _, role := range h.Roles {
+			if role == "cluster-control-plane" {
+				return h.Address
+			}
+		}
+	}
+	// Fallback to VIP if no control plane found
+	return cfg.Cluster.VIP
 }

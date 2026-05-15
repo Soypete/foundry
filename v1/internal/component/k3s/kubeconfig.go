@@ -33,11 +33,12 @@ func RetrieveKubeconfig(executor SSHExecutor) (string, error) {
 }
 
 // ModifyKubeconfigServer modifies the server URL in a kubeconfig
-// This replaces 127.0.0.1 with the actual VIP for remote access
-func ModifyKubeconfigServer(kubeconfig string, vip string) string {
+// This replaces 127.0.0.1 with the provided server address for remote access
+// serverAddress should be the control plane's Tailscale IP (or VIP on same network)
+func ModifyKubeconfigServer(kubeconfig string, serverAddress string) string {
 	// K3s defaults to using 127.0.0.1:6443 in the kubeconfig
-	// We need to replace this with the VIP for remote access
-	modified := strings.ReplaceAll(kubeconfig, "https://127.0.0.1:6443", fmt.Sprintf("https://%s:6443", vip))
+	// We need to replace this with the server address for remote access
+	modified := strings.ReplaceAll(kubeconfig, "https://127.0.0.1:6443", fmt.Sprintf("https://%s:6443", serverAddress))
 	return modified
 }
 
@@ -78,16 +79,17 @@ func LoadKubeconfig(ctx context.Context, client KubeconfigClient) (string, error
 }
 
 // RetrieveAndStoreKubeconfig is a convenience function that retrieves the kubeconfig
-// from a K3s node, modifies it to use the VIP, and stores it in OpenBAO
-func RetrieveAndStoreKubeconfig(ctx context.Context, executor SSHExecutor, client KubeconfigClient, vip string) error {
+// from a K3s node, modifies it to use the server address, and stores it in OpenBAO
+// serverAddress is the address used to access the cluster (e.g., Tailscale IP or VIP)
+func RetrieveAndStoreKubeconfig(ctx context.Context, executor SSHExecutor, client KubeconfigClient, serverAddress string) error {
 	// Retrieve kubeconfig from node
 	kubeconfig, err := RetrieveKubeconfig(executor)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve kubeconfig: %w", err)
 	}
 
-	// Modify server URL to use VIP
-	kubeconfig = ModifyKubeconfigServer(kubeconfig, vip)
+	// Modify server URL to use server address
+	kubeconfig = ModifyKubeconfigServer(kubeconfig, serverAddress)
 
 	// Store in OpenBAO
 	if err := StoreKubeconfig(ctx, client, kubeconfig); err != nil {
