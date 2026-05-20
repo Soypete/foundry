@@ -15,6 +15,18 @@ OpenBAO stores sensitive data including:
 **Deployment**: Container on infrastructure host
 **Default Port**: 8200
 
+## OpenBAO Injector
+
+**Purpose**: Inject OpenBAO secrets into Kubernetes pods as sidecar-rendered files
+
+Deploys the OpenBao agent injector via Helm and registers a `MutatingWebhookConfiguration` that intercepts pod creation. Pods annotated with `vault.hashicorp.com/agent-inject: "true"` receive a sidecar that authenticates to OpenBAO using the pod's Kubernetes service account, renders templated secrets to `/vault/secrets/<name>`, and refreshes them on the configured TTL.
+
+When `configure_k8s_auth: true` is set in stack config, foundry also enables the OpenBAO Kubernetes auth method, creates the `vault-reviewer` ServiceAccount in `kube-system`, and applies any roles listed under `k8s_auth_roles`.
+
+**Dependencies**: OpenBAO, K3s
+**Deployment**: Helm release `openbao-injector` in the `openbao` namespace
+**Details**: See [pod-secrets.md](./pod-secrets.md) for annotation reference and troubleshooting
+
 ## PowerDNS
 
 **Purpose**: Authoritative DNS server with API
@@ -58,6 +70,16 @@ K3s provides:
 **Purpose**: Virtual IP for HA control plane
 
 Provides a single stable IP for the Kubernetes API server across multiple control plane nodes.
+
+## Tailscale
+
+**Purpose**: Secure mesh connectivity for cluster nodes and service exposure
+
+Installs the Tailscale Kubernetes operator and advertises the cluster VIP subnet onto the tailnet. Services can be exposed to the tailnet by annotating them with `tailscale.com/expose`, optionally with a `tailscale.com/hostname` for a stable name. OAuth client credentials are pulled from the configured secret source.
+
+**Dependencies**: K3s
+**Deployment**: Helm release in the `tailscale` namespace
+**Details**: See [tailscale-integration.md](./tailscale-integration.md)
 
 ## Contour
 
