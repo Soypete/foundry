@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
+	"github.com/catalystcommunity/foundry/v1/internal/component/openbaoinjector"
 	"github.com/catalystcommunity/foundry/v1/internal/component/statushelpers"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
+	"github.com/catalystcommunity/foundry/v1/internal/helm"
 	"github.com/catalystcommunity/foundry/v1/internal/systemd"
 	"github.com/urfave/cli/v3"
 )
@@ -24,7 +28,8 @@ Examples:
   foundry component status openbao
   foundry component status dns
   foundry component status zot
-  foundry component status k3s`,
+  foundry component status k3s
+  foundry component status openbao-injector`,
 	Action: runStatus,
 }
 
@@ -67,6 +72,8 @@ func runStatus(ctx context.Context, cmd *cli.Command) error {
 		status, err = CheckZotStatus(ctx, cfg)
 	case "k3s", "kubernetes":
 		status, err = CheckK3sStatus(ctx, cfg)
+	case "openbao-injector":
+		status, err = CheckOpenBAOInjectorStatus(ctx, cfg)
 	default:
 		return fmt.Errorf("status checking not implemented for component: %s", name)
 	}
@@ -491,4 +498,40 @@ func CheckK3sStatus(ctx context.Context, cfg *config.Config) (*component.Compone
 		Healthy:   healthy,
 		Message:   message,
 	}, nil
+}
+
+// CheckOpenBAOInjectorStatus checks the OpenBao agent injector status by
+// querying the Helm release in its target namespace via the kubeconfig
+// produced by `foundry component install k3s`.
+func CheckOpenBAOInjectorStatus(ctx context.Context, cfg *config.Config) (*component.ComponentStatus, error) {
+	configDir, err := config.GetConfigDir()
+	if err != nil {
+		return &component.ComponentStatus{
+			Installed: false,
+			Healthy:   false,
+			Message:   fmt.Sprintf("failed to get config directory: %v", err),
+		}, nil
+	}
+
+	kubeconfigPath := filepath.Join(configDir, "kubeconfig")
+	kubeconfigBytes, err := os.ReadFile(kubeconfigPath)
+	if err != nil {
+		return &component.ComponentStatus{
+			Installed: false,
+			Healthy:   false,
+			Message:   fmt.Sprintf("kubeconfig not found at %s (install k3s first): %v", kubeconfigPath, err),
+		}, nil
+	}
+
+	helmClient, err := helm.NewClient(kubeconfigBytes, openbaoinjector.DefaultNamespace)
+	if err != nil {
+		return &component.ComponentStatus{
+			Installed: false,
+			Healthy:   false,
+			Message:   fmt.Sprintf("failed to create helm client: %v", err),
+		}, nil
+	}
+
+	comp := openbaoinjector.NewComponent(helmClient, nil, nil)
+	return comp.Status(ctx)
 }
