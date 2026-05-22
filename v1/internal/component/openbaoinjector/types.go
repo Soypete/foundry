@@ -26,6 +26,7 @@ type K8sClient interface {
 	ApplyClusterRoleBinding(ctx context.Context, manifest string) error
 	GetClusterCACert(ctx context.Context) (string, error)
 	GetKubernetesHost() string
+	MutatingWebhookExists(ctx context.Context, name string) (bool, error)
 }
 
 // OpenBAOClient defines the OpenBAO operations needed for configuring Kubernetes auth

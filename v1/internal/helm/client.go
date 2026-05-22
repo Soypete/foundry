@@ -325,6 +325,7 @@ func (c *Client) doUpgrade(ctx context.Context, opts UpgradeOptions, namespace s
 	upgradeAction.Namespace = namespace
 	upgradeAction.Wait = opts.Wait
 	upgradeAction.Install = opts.Install
+	upgradeAction.Force = opts.Force
 	if opts.Timeout > 0 {
 		upgradeAction.Timeout = opts.Timeout
 	}

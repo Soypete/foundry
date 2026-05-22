@@ -43,6 +43,10 @@ type UpgradeOptions struct {
 	CreateNamespace bool // Create namespace if it doesn't exist
 	Wait            bool
 	Timeout         time.Duration
+	// Force re-creates resources from the rendered chart. Use when in-cluster
+	// state has drifted from helm's stored manifest (e.g. a webhook was
+	// deleted but the release status still reports deployed).
+	Force bool
 }
 
 // UninstallOptions contains options for uninstalling a Helm release

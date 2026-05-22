@@ -17,6 +17,12 @@ const (
 	// ReleaseName is the Helm release name
 	ReleaseName = "openbao-injector"
 
+	// WebhookName is the MutatingWebhookConfiguration the chart creates.
+	// We track it by name so we can detect drift (release deployed, webhook
+	// missing) after events like power outages that can leave the cluster
+	// out of sync with helm's stored manifest.
+	WebhookName = "openbao-injector-agent-injector-cfg"
+
 	// Helm repo constants
 	repoName = "openbao"
 	repoURL  = "https://openbao.github.io/openbao-helm"
@@ -54,13 +60,29 @@ func Install(ctx context.Context, helmClient HelmClient, k8sClient K8sClient, op
 
 	values := buildHelmValues(cfg)
 
+	// Detect drift between helm's view and the cluster: if the release is
+	// "deployed" but the MutatingWebhookConfiguration is missing (e.g. it was
+	// deleted during a power-outage recovery), use Force on upgrade so helm
+	// re-creates chart resources instead of issuing a no-op patch.
+	driftDetected := false
+	if k8sClient != nil {
+		exists, err := k8sClient.MutatingWebhookExists(ctx, WebhookName)
+		if err == nil && !exists {
+			driftDetected = true
+		}
+	}
+
 	// Check if release already exists
 	releases, err := helmClient.List(ctx, cfg.Namespace)
 	if err == nil {
 		for _, rel := range releases {
 			if rel.Name == ReleaseName {
 				if rel.Status == "deployed" {
-					fmt.Println("  Upgrading existing OpenBao injector deployment...")
+					if driftDetected {
+						fmt.Println("  Webhook missing — reconciling drifted OpenBao injector release...")
+					} else {
+						fmt.Println("  Upgrading existing OpenBao injector deployment...")
+					}
 					if err := helmClient.Upgrade(ctx, helm.UpgradeOptions{
 						ReleaseName: ReleaseName,
 						Namespace:   cfg.Namespace,
@@ -69,6 +91,7 @@ func Install(ctx context.Context, helmClient HelmClient, k8sClient K8sClient, op
 						Values:      values,
 						Wait:        true,
 						Timeout:     installTimeout,
+						Force:       driftDetected,
 					}); err != nil {
 						return fmt.Errorf("failed to upgrade openbao injector: %w", err)
 					}

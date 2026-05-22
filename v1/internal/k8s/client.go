@@ -636,6 +636,20 @@ func (c *Client) ServiceMonitorCRDExists(ctx context.Context) (bool, error) {
 	return c.CRDExists(ctx, "servicemonitors.monitoring.coreos.com")
 }
 
+// MutatingWebhookExists checks if a MutatingWebhookConfiguration with the given
+// name exists in the cluster. Returns (false, nil) when absent so callers can
+// distinguish "missing" from "API error."
+func (c *Client) MutatingWebhookExists(ctx context.Context, name string) (bool, error) {
+	_, err := c.clientset.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to check MutatingWebhookConfiguration %s: %w", name, err)
+	}
+	return true, nil
+}
+
 // PatchDeploymentArgs replaces an argument in a deployment's container args
 // This is useful for modifying command-line arguments that can't be changed via Helm values
 func (c *Client) PatchDeploymentArgs(ctx context.Context, namespace, name string, oldArg, newArg string) error {

@@ -9,6 +9,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/helm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 )
 
 type mockHelmClient struct {
@@ -276,4 +277,74 @@ func TestComponent_Install(t *testing.T) {
 			}
 		})
 	}
+}
+
+// driftK8sClient implements just enough of K8sClient to drive the drift path.
+// Only MutatingWebhookExists is exercised; the other methods are stubs that
+// must not be called by Install when configureK8sAuth=false.
+type driftK8sClient struct {
+	webhookExists bool
+	webhookErr    error
+}
+
+func (d *driftK8sClient) MutatingWebhookExists(ctx context.Context, name string) (bool, error) {
+	return d.webhookExists, d.webhookErr
+}
+
+func (d *driftK8sClient) GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
+	panic("not used in drift test")
+}
+func (d *driftK8sClient) CreateServiceAccount(ctx context.Context, name string, sa *corev1.ServiceAccount) error {
+	panic("not used in drift test")
+}
+func (d *driftK8sClient) GetServiceAccountToken(ctx context.Context, namespace, name string) (string, error) {
+	panic("not used in drift test")
+}
+func (d *driftK8sClient) ApplyClusterRoleBinding(ctx context.Context, manifest string) error {
+	panic("not used in drift test")
+}
+func (d *driftK8sClient) GetClusterCACert(ctx context.Context) (string, error) {
+	panic("not used in drift test")
+}
+func (d *driftK8sClient) GetKubernetesHost() string { panic("not used in drift test") }
+
+func TestInstall_DriftDetected_ForcesUpgrade(t *testing.T) {
+	mock := &mockHelmClient{
+		listResponse: []helm.Release{
+			{Name: "openbao-injector", Status: "deployed", AppVersion: "0.26.2"},
+		},
+	}
+	k8s := &driftK8sClient{webhookExists: false}
+	cfg := &Config{
+		Version:           "0.26.2",
+		Namespace:         "openbao",
+		ExternalVaultAddr: "http://10.0.0.1:8200",
+	}
+
+	err := Install(context.Background(), mock, k8s, nil, cfg, false)
+
+	require.NoError(t, err)
+	require.Len(t, mock.upgradeCalls, 1, "drifted release should trigger an upgrade")
+	assert.True(t, mock.upgradeCalls[0].Force, "drifted release must upgrade with Force=true so chart resources are re-applied")
+	assert.Len(t, mock.installCalls, 0)
+}
+
+func TestInstall_WebhookPresent_UpgradeWithoutForce(t *testing.T) {
+	mock := &mockHelmClient{
+		listResponse: []helm.Release{
+			{Name: "openbao-injector", Status: "deployed", AppVersion: "0.26.2"},
+		},
+	}
+	k8s := &driftK8sClient{webhookExists: true}
+	cfg := &Config{
+		Version:           "0.26.3",
+		Namespace:         "openbao",
+		ExternalVaultAddr: "http://10.0.0.1:8200",
+	}
+
+	err := Install(context.Background(), mock, k8s, nil, cfg, false)
+
+	require.NoError(t, err)
+	require.Len(t, mock.upgradeCalls, 1)
+	assert.False(t, mock.upgradeCalls[0].Force, "Force should stay off when in-cluster state matches helm")
 }
