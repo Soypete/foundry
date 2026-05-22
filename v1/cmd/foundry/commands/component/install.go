@@ -19,6 +19,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/grafana"
 	"github.com/catalystcommunity/foundry/v1/internal/component/loki"
 	"github.com/catalystcommunity/foundry/v1/internal/component/openbao"
+	"github.com/catalystcommunity/foundry/v1/internal/component/openbaoinjector"
 	"github.com/catalystcommunity/foundry/v1/internal/component/prometheus"
 	"github.com/catalystcommunity/foundry/v1/internal/component/seaweedfs"
 	componentStorage "github.com/catalystcommunity/foundry/v1/internal/component/storage"
@@ -103,17 +104,18 @@ Examples:
 
 // k8sComponents lists all components that are installed via kubeconfig (Helm/K8s)
 var k8sComponents = map[string]bool{
-	"gateway-api":  true,
-	"contour":      true,
-	"cert-manager": true,
-	"storage":      true,
-	"seaweedfs":    true,
-	"prometheus":   true,
-	"loki":         true,
-	"grafana":      true,
-	"external-dns": true,
-	"velero":       true,
-	"tailscale":    true,
+	"gateway-api":      true,
+	"contour":          true,
+	"cert-manager":     true,
+	"storage":          true,
+	"seaweedfs":        true,
+	"prometheus":       true,
+	"loki":             true,
+	"grafana":          true,
+	"external-dns":     true,
+	"velero":           true,
+	"tailscale":        true,
+	"openbao-injector": true,
 }
 
 func runInstall(ctx context.Context, cmd *cli.Command) error {
@@ -368,6 +370,20 @@ func installK8sComponent(ctx context.Context, cmd *cli.Command, name string, sta
 
 		// Create component with clients directly (like contour, prometheus, etc.)
 		componentWithClients = tailscale.NewComponentWithClients(tsComponentConfig, vip, helmClient, k8sClient)
+	case "openbao-injector":
+		// Inject the OpenBao address so the webhook knows where to reach it
+		url, err := stackConfig.GetPrimaryOpenBAOURL()
+		if err != nil {
+			return fmt.Errorf("failed to get OpenBao address for injector: %w", err)
+		}
+		cfg["external_vault_addr"] = url
+
+		// Create OpenBAO client for configuring Kubernetes auth
+		openbaoClient, err := createOpenBAOClient(stackConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create OpenBAO client: %w", err)
+		}
+		componentWithClients = openbaoinjector.NewComponent(helmClient, k8sClient, openbaoClient)
 	default:
 		return fmt.Errorf("unknown kubernetes component: %s", name)
 	}
@@ -391,6 +407,40 @@ func installK8sComponent(ctx context.Context, cmd *cli.Command, name string, sta
 	}
 
 	return nil
+}
+
+// createOpenBAOClient builds an authenticated OpenBAO client using the root
+// token stashed under ~/.foundry/openbao-keys/<cluster>/keys.json by
+// `foundry openbao init`. Used by components like the injector that need to
+// configure OpenBAO itself during install.
+func createOpenBAOClient(stackConfig *config.Config) (*openbao.Client, error) {
+	configDir, err := config.GetConfigDir()
+	if err != nil {
+		return nil, err
+	}
+
+	openBAOAddr, err := stackConfig.GetPrimaryOpenBAOURL()
+	if err != nil {
+		return nil, err
+	}
+
+	keysPath := filepath.Join(configDir, "openbao-keys", stackConfig.Cluster.Name, "keys.json")
+	keysData, err := os.ReadFile(keysPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read OpenBAO keys file: %w", err)
+	}
+
+	var keys struct {
+		RootToken string `json:"root_token"`
+	}
+	if err := json.Unmarshal(keysData, &keys); err != nil {
+		return nil, fmt.Errorf("failed to parse OpenBAO keys file: %w", err)
+	}
+	if keys.RootToken == "" {
+		return nil, fmt.Errorf("root token not found in keys file")
+	}
+
+	return openbao.NewClient(openBAOAddr, keys.RootToken), nil
 }
 
 // getSeaweedFSCredentials retrieves SeaweedFS credentials from the seaweedfs secret
