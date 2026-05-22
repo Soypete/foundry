@@ -140,6 +140,20 @@ func Install(ctx context.Context, helmClient HelmClient, k8sClient K8sClient, op
 	fmt.Printf("  Pods annotated with vault.hashicorp.com/agent-inject=true will now\n")
 	fmt.Printf("  automatically receive secrets from OpenBao at %s\n", cfg.ExternalVaultAddr)
 
+	// Surface pods that opted into injection but were created before the
+	// webhook was active (or while it was missing). Mutating webhooks only
+	// fire on creation, so these stay without a sidecar until restarted.
+	if k8sClient != nil {
+		stuck, err := k8sClient.ListPodsNeedingInjectorRestart(ctx)
+		if err == nil && len(stuck) > 0 {
+			fmt.Printf("\n  ! %d pod(s) carry inject annotations but have no sidecar.\n", len(stuck))
+			fmt.Printf("    Restart them so the webhook can render secrets:\n")
+			for _, p := range stuck {
+				fmt.Printf("      kubectl -n %s delete pod %s\n", p.Namespace, p.Name)
+			}
+		}
+	}
+
 	// Configure Kubernetes auth if requested
 	if configureK8sAuth {
 		if k8sClient == nil || openbaoClient == nil {

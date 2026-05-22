@@ -650,6 +650,36 @@ func (c *Client) MutatingWebhookExists(ctx context.Context, name string) (bool, 
 	return true, nil
 }
 
+// PodRef identifies a pod by namespace and name without pulling the full spec.
+type PodRef struct {
+	Namespace string
+	Name      string
+}
+
+// ListPodsNeedingInjectorRestart returns pods that opted into vault agent
+// injection (annotation vault.hashicorp.com/agent-inject=true) but were
+// created when no sidecar was rendered — they have only one container.
+// Used to surface workloads stuck without secrets after the webhook is
+// re-created, since mutating webhooks only fire on pod creation.
+func (c *Client) ListPodsNeedingInjectorRestart(ctx context.Context) ([]PodRef, error) {
+	podList, err := c.clientset.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	var refs []PodRef
+	for _, pod := range podList.Items {
+		if pod.Annotations["vault.hashicorp.com/agent-inject"] != "true" {
+			continue
+		}
+		if len(pod.Spec.Containers) > 1 {
+			continue
+		}
+		refs = append(refs, PodRef{Namespace: pod.Namespace, Name: pod.Name})
+	}
+	return refs, nil
+}
+
 // PatchDeploymentArgs replaces an argument in a deployment's container args
 // This is useful for modifying command-line arguments that can't be changed via Helm values
 func (c *Client) PatchDeploymentArgs(ctx context.Context, namespace, name string, oldArg, newArg string) error {

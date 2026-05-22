@@ -6,6 +6,7 @@ import (
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
 	"github.com/catalystcommunity/foundry/v1/internal/helm"
+	"github.com/catalystcommunity/foundry/v1/internal/k8s"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -27,6 +28,7 @@ type K8sClient interface {
 	GetClusterCACert(ctx context.Context) (string, error)
 	GetKubernetesHost() string
 	MutatingWebhookExists(ctx context.Context, name string) (bool, error)
+	ListPodsNeedingInjectorRestart(ctx context.Context) ([]k8s.PodRef, error)
 }
 
 // OpenBAOClient defines the OpenBAO operations needed for configuring Kubernetes auth

@@ -1,16 +1,42 @@
 package openbaoinjector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"testing"
 
 	"github.com/catalystcommunity/foundry/v1/internal/helm"
+	"github.com/catalystcommunity/foundry/v1/internal/k8s"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 )
+
+// captureStdout redirects os.Stdout while fn runs and returns what was written.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+
+	done := make(chan struct{})
+	var buf bytes.Buffer
+	go func() {
+		_, _ = io.Copy(&buf, r)
+		close(done)
+	}()
+
+	fn()
+	w.Close()
+	<-done
+	return buf.String()
+}
 
 type mockHelmClient struct {
 	addRepoCalls   []helm.RepoAddOptions
@@ -279,16 +305,22 @@ func TestComponent_Install(t *testing.T) {
 	}
 }
 
-// driftK8sClient implements just enough of K8sClient to drive the drift path.
-// Only MutatingWebhookExists is exercised; the other methods are stubs that
-// must not be called by Install when configureK8sAuth=false.
+// driftK8sClient implements just enough of K8sClient to drive the drift +
+// post-install warning paths. The methods used by configureKubernetesAuth
+// panic — those should not be reached when configureK8sAuth=false.
 type driftK8sClient struct {
 	webhookExists bool
 	webhookErr    error
+	stuckPods     []k8s.PodRef
+	stuckErr      error
 }
 
 func (d *driftK8sClient) MutatingWebhookExists(ctx context.Context, name string) (bool, error) {
 	return d.webhookExists, d.webhookErr
+}
+
+func (d *driftK8sClient) ListPodsNeedingInjectorRestart(ctx context.Context) ([]k8s.PodRef, error) {
+	return d.stuckPods, d.stuckErr
 }
 
 func (d *driftK8sClient) GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
@@ -347,4 +379,48 @@ func TestInstall_WebhookPresent_UpgradeWithoutForce(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, mock.upgradeCalls, 1)
 	assert.False(t, mock.upgradeCalls[0].Force, "Force should stay off when in-cluster state matches helm")
+}
+
+func TestInstall_WarnsAboutStuckPods(t *testing.T) {
+	mock := &mockHelmClient{
+		listResponse: []helm.Release{
+			{Name: "openbao-injector", Status: "deployed", AppVersion: "0.26.2"},
+		},
+	}
+	k8sMock := &driftK8sClient{
+		webhookExists: false, // triggers the drift reconcile
+		stuckPods: []k8s.PodRef{
+			{Namespace: "agents", Name: "redditwatch-suggest-abc"},
+			{Namespace: "chatbot", Name: "pedro-discord-xyz"},
+		},
+	}
+	cfg := &Config{
+		Version:           "0.26.2",
+		Namespace:         "openbao",
+		ExternalVaultAddr: "http://10.0.0.1:8200",
+	}
+
+	out := captureStdout(t, func() {
+		require.NoError(t, Install(context.Background(), mock, k8sMock, nil, cfg, false))
+	})
+
+	assert.Contains(t, out, "2 pod(s) carry inject annotations but have no sidecar")
+	assert.Contains(t, out, "kubectl -n agents delete pod redditwatch-suggest-abc")
+	assert.Contains(t, out, "kubectl -n chatbot delete pod pedro-discord-xyz")
+}
+
+func TestInstall_NoStuckPods_NoWarning(t *testing.T) {
+	mock := &mockHelmClient{}
+	k8sMock := &driftK8sClient{webhookExists: true /* stuckPods nil */}
+	cfg := &Config{
+		Version:           "0.26.2",
+		Namespace:         "openbao",
+		ExternalVaultAddr: "http://10.0.0.1:8200",
+	}
+
+	out := captureStdout(t, func() {
+		require.NoError(t, Install(context.Background(), mock, k8sMock, nil, cfg, false))
+	})
+
+	assert.NotContains(t, out, "no sidecar")
 }
