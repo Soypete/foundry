@@ -53,6 +53,30 @@ K3s provides:
 **Deployment**: Native install on cluster nodes
 **Default Port**: 6443 (API server)
 
+### Installing K3s
+
+Install or repair K3s on your cluster nodes:
+
+```bash
+# Install/repair K3s on the first control plane node
+foundry component install k3s
+
+# Install/repair K3s on all cluster nodes (control plane + workers)
+foundry component install k3s --all-nodes
+
+# Dry run to see what would happen
+foundry component install k3s --dry-run
+```
+
+The `component install k3s` command:
+- Populates `/etc/rancher/k3s/registries.yaml` with Zot registry configuration
+- Idempotent: only restarts K3s if configuration actually changes
+- Connects to each node individually, so `--all-nodes` reconciles workers too
+
+This command reconciles configuration on nodes where K3s is **already
+installed**; it errors out if K3s is missing. To install K3s on a new node, use
+`foundry stack install`.
+
 ### kube-vip
 
 **Purpose**: Virtual IP for HA control plane

@@ -498,3 +498,132 @@ func TestWaitForKubeVIPReady(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateK3sConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *Config
+		exec    func(command string) (*ssh.ExecResult, error)
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "k3s not installed returns error",
+			cfg:  &Config{},
+			exec: func(command string) (*ssh.ExecResult, error) {
+				if strings.Contains(command, "systemctl is-active k3s") {
+					return &ssh.ExecResult{ExitCode: 3, Stdout: "inactive"}, nil
+				}
+				return &ssh.ExecResult{ExitCode: 0}, nil
+			},
+			wantErr: true,
+			errMsg:  "k3s is not installed",
+		},
+		{
+			name: "successful update with registry config",
+			cfg: &Config{
+				RegistryConfig: "mirrors:\n  docker.io:\n    endpoint:\n      - http://zot:5000",
+			},
+			exec: func(command string) (*ssh.ExecResult, error) {
+				if strings.Contains(command, "systemctl is-active k3s") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
+				}
+				if strings.Contains(command, "cat /etc/rancher/k3s/registries.yaml") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "mirrors:\n  docker.io:\n    endpoint:\n      - http://other:5000"}, nil
+				}
+				if strings.Contains(command, "/etc/rancher/k3s/registries.yaml") {
+					assert.Contains(t, command, "docker.io")
+					assert.Contains(t, command, "http://zot:5000")
+					return &ssh.ExecResult{ExitCode: 0}, nil
+				}
+				if strings.Contains(command, "systemctl restart k3s") {
+					return &ssh.ExecResult{ExitCode: 0}, nil
+				}
+				if strings.Contains(command, "k3s kubectl get nodes") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "node1   Ready"}, nil
+				}
+				return &ssh.ExecResult{ExitCode: 0}, nil
+			},
+			wantErr: false,
+		},
+		{
+			name: "idempotent - no changes when config unchanged",
+			cfg: &Config{
+				RegistryConfig: "mirrors:\n  docker.io:\n    endpoint:\n      - http://zot:5000",
+			},
+			exec: func(command string) (*ssh.ExecResult, error) {
+				if strings.Contains(command, "systemctl is-active k3s") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
+				}
+				if strings.Contains(command, "cat /etc/rancher/k3s/registries.yaml") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "mirrors:\n  docker.io:\n    endpoint:\n      - http://zot:5000"}, nil
+				}
+				if strings.Contains(command, "systemctl restart k3s") {
+					return &ssh.ExecResult{ExitCode: 0}, nil
+				}
+				return &ssh.ExecResult{ExitCode: 0}, nil
+			},
+			wantErr: false,
+		},
+		{
+			name: "update with DNS servers",
+			cfg: &Config{
+				DNSServers: []string{"192.168.1.10", "8.8.8.8"},
+			},
+			exec: func(command string) (*ssh.ExecResult, error) {
+				if strings.Contains(command, "systemctl is-active k3s") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
+				}
+				if strings.Contains(command, "systemctl is-active systemd-resolved") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
+				}
+				if strings.Contains(command, "systemd/resolved.conf.d") {
+					assert.Contains(t, command, "192.168.1.10")
+					return &ssh.ExecResult{ExitCode: 0}, nil
+				}
+				if strings.Contains(command, "systemctl restart k3s") {
+					return &ssh.ExecResult{ExitCode: 0}, nil
+				}
+				if strings.Contains(command, "k3s kubectl get nodes") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "node1   Ready"}, nil
+				}
+				return &ssh.ExecResult{ExitCode: 0}, nil
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty config - no changes",
+			cfg:  &Config{},
+			exec: func(command string) (*ssh.ExecResult, error) {
+				if strings.Contains(command, "systemctl is-active k3s") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
+				}
+				if strings.Contains(command, "cat /etc/rancher/k3s/registries.yaml") {
+					return &ssh.ExecResult{ExitCode: 0, Stdout: ""}, nil
+				}
+				// Should NOT try to restart k3s
+				if strings.Contains(command, "systemctl restart") {
+					t.Error("k3s should not be restarted when no config changes")
+				}
+				return &ssh.ExecResult{ExitCode: 0}, nil
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &mockInstallSSHExecutor{execFunc: tt.exec}
+			err := UpdateK3sConfig(context.Background(), executor, tt.cfg)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}

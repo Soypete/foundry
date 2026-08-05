@@ -57,6 +57,83 @@ func IsKubeVIPInstalled(executor SSHExecutor) (bool, error) {
 	return result.ExitCode == 0, nil
 }
 
+// UpdateK3sConfig applies configuration updates to an existing K3s node
+// This is an idempotent operation that only restarts k3s when configuration actually changes
+func UpdateK3sConfig(ctx context.Context, executor SSHExecutor, cfg *Config) error {
+	// Check if K3s is installed
+	isInstalled, err := IsK3sInstalled(executor)
+	if err != nil {
+		return fmt.Errorf("failed to check if K3s is installed: %w", err)
+	}
+
+	if !isInstalled {
+		return fmt.Errorf("k3s is not installed on this node")
+	}
+
+	// Track if we need to restart K3s
+	needsRestart := false
+
+	// Update etcd config if configured (for virtualized environments)
+	if len(cfg.EtcdArgs) > 0 {
+		changed, err := updateEtcdConfig(executor, cfg.EtcdArgs)
+		if err != nil {
+			return fmt.Errorf("failed to update etcd config: %w", err)
+		}
+		if changed {
+			fmt.Println("   etcd config updated")
+			needsRestart = true
+		} else {
+			fmt.Println("   ✓ etcd config unchanged")
+		}
+	}
+
+	// Update registries.yaml if configured (idempotent - only restart if changed)
+	if cfg.RegistryConfig != "" {
+		fmt.Println("   Updating registries.yaml...")
+		// Check if config actually changed before restarting
+		existingResult, _ := executor.Exec("cat /etc/rancher/k3s/registries.yaml 2>/dev/null")
+		existingConfig := ""
+		if existingResult != nil {
+			existingConfig = existingResult.Stdout
+		}
+		if strings.TrimSpace(existingConfig) != strings.TrimSpace(cfg.RegistryConfig) {
+			if err := createRegistriesConfig(executor, cfg.RegistryConfig); err != nil {
+				return fmt.Errorf("failed to update registries config: %w", err)
+			}
+			fmt.Println("   registries.yaml updated")
+			needsRestart = true
+		} else {
+			fmt.Println("   ✓ registries.yaml unchanged")
+		}
+	}
+
+	// Configure DNS if servers are provided
+	if len(cfg.DNSServers) > 0 {
+		fmt.Println("   Updating DNS configuration...")
+		if err := configureDNS(executor, cfg.DNSServers); err != nil {
+			return fmt.Errorf("failed to configure DNS: %w", err)
+		}
+		needsRestart = true
+	}
+
+	// Restart K3s if any config changed
+	if needsRestart {
+		fmt.Println("   Restarting k3s to apply config changes...")
+		if _, err := executor.Exec("sudo systemctl restart k3s"); err != nil {
+			return fmt.Errorf("failed to restart k3s: %w", err)
+		}
+		// Wait for k3s to be ready after restart
+		if err := waitForK3sReady(executor, DefaultRetryConfig()); err != nil {
+			return fmt.Errorf("k3s failed to become ready after restart: %w", err)
+		}
+	} else {
+		fmt.Println("   ✓ No config changes, skipping restart")
+	}
+
+	fmt.Println("   ✓ Configuration applied successfully")
+	return nil
+}
+
 // InstallControlPlane installs K3s control plane on a node
 func InstallControlPlane(ctx context.Context, executor SSHExecutor, cfg *Config) error {
 	// Validate configuration

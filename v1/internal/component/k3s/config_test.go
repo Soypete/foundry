@@ -109,6 +109,79 @@ func TestGenerateRegistriesConfig(t *testing.T) {
 	}
 }
 
+func TestPopulateRegistryConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		zotAddr     string
+		wantEmpty   bool
+		wantContain []string
+	}{
+		{
+			name:      "empty zot address produces empty config",
+			zotAddr:   "",
+			wantEmpty: true,
+		},
+		{
+			name:      "whitespace-only zot address is treated as empty",
+			zotAddr:   "   ",
+			wantEmpty: true,
+		},
+		{
+			name:      "valid zot address populates config",
+			zotAddr:   "zot.example.com",
+			wantEmpty: false,
+			wantContain: []string{
+				"docker.io",
+				"ghcr.io",
+				"http://zot.example.com:5000",
+			},
+		},
+		{
+			name:      "IP address populates config",
+			zotAddr:   "192.168.1.100",
+			wantEmpty: false,
+			wantContain: []string{
+				"docker.io",
+				"http://192.168.1.100:5000",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				AdditionalRegistries: []AdditionalRegistry{
+					{Name: "custom.registry.io"},
+				},
+			}
+			PopulateRegistryConfig(cfg, tt.zotAddr)
+
+			if tt.wantEmpty {
+				assert.Empty(t, cfg.RegistryConfig, "RegistryConfig should be empty when zotAddr is empty")
+			} else {
+				assert.NotEmpty(t, cfg.RegistryConfig, "RegistryConfig should not be empty when zotAddr is provided")
+				for _, want := range tt.wantContain {
+					assert.Contains(t, cfg.RegistryConfig, want, "expected config to contain: %s", want)
+				}
+			}
+		})
+	}
+}
+
+func TestPopulateRegistryConfig_WithAdditionalRegistries(t *testing.T) {
+	cfg := &Config{
+		AdditionalRegistries: []AdditionalRegistry{
+			{Name: "my.registry.io", HTTP: boolPtr(true)},
+		},
+	}
+	PopulateRegistryConfig(cfg, "zot.example.com")
+
+	assert.NotEmpty(t, cfg.RegistryConfig)
+	assert.Contains(t, cfg.RegistryConfig, "my.registry.io")
+	assert.Contains(t, cfg.RegistryConfig, "docker.io")
+	assert.Contains(t, cfg.RegistryConfig, "ghcr.io")
+}
+
 func strPtr(s string) *string { return &s }
 func boolPtr(b bool) *bool    { return &b }
 
