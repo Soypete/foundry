@@ -280,6 +280,7 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 		VIP:          cfg.Cluster.VIP,
 		TLSSANs: []string{
 			cfg.Cluster.VIP,
+			firstHost.Address, // Add control plane's Tailscale IP for direct access
 			fmt.Sprintf("%s.%s", cfg.Cluster.Name, cfg.Cluster.PrimaryDomain),
 		},
 		DisableComponents: []string{"traefik", "servicelb"},
@@ -318,7 +319,8 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 	time.Sleep(10 * time.Second)
 
 	// Step 7: Join additional control plane nodes
-	serverURL := fmt.Sprintf("https://%s:6443", cfg.Cluster.VIP)
+	// Use control plane node's Tailscale IP, not VIP, for direct node-to-node communication
+	serverURL := fmt.Sprintf("https://%s:6443", firstHost.Address)
 	for i := firstCPIndex + 1; i < len(clusterHosts); i++ {
 		role := nodeRoles[i]
 		if !role.IsControlPlane {
@@ -406,7 +408,8 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 	}
 	defer conn.Close()
 
-	if err := k3s.RetrieveAndStoreKubeconfig(ctx, conn, openbaoClient, cfg.Cluster.VIP); err != nil {
+	// Use Tailscale IP instead of VIP for kubeconfig - workers need direct access to API server
+	if err := k3s.RetrieveAndStoreKubeconfig(ctx, conn, openbaoClient, firstHost.Address); err != nil {
 		return fmt.Errorf("failed to retrieve kubeconfig: %w", err)
 	}
 	fmt.Println("✓ Kubeconfig retrieved and stored in OpenBAO")

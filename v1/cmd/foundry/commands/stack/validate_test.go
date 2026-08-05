@@ -713,3 +713,187 @@ func TestRunStackValidate_Integration(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+func TestValidateTailscaleConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *config.Config
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "valid - tailscale not configured",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				DNS: &config.DNSConfig{
+					InfrastructureZones: []config.DNSZone{{Name: "infra.example.com"}},
+					KubernetesZones:     []config.DNSZone{{Name: "k8s.example.com"}},
+					Backend:             "sqlite",
+					APIKey:              "test-key",
+				},
+				Cluster: config.ClusterConfig{
+					Name:          "test-cluster",
+					PrimaryDomain: "example.com",
+					VIP:           "192.168.1.100",
+				},
+				Hosts: []*host.Host{
+					{Hostname: "test-host", Address: "192.168.1.10", Roles: []string{host.RoleOpenBAO}},
+				},
+				Components: config.ComponentMap{
+					"openbao": {},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid - tailscale enabled with credentials",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				DNS: &config.DNSConfig{
+					InfrastructureZones: []config.DNSZone{{Name: "infra.example.com"}},
+					KubernetesZones:     []config.DNSZone{{Name: "k8s.example.com"}},
+					Backend:             "sqlite",
+					APIKey:              "test-key",
+				},
+				Cluster: config.ClusterConfig{
+					Name:          "test-cluster",
+					PrimaryDomain: "example.com",
+					VIP:           "192.168.1.100",
+				},
+				Hosts: []*host.Host{
+					{Hostname: "test-host", Address: "192.168.1.10", Roles: []string{host.RoleOpenBAO}},
+				},
+				Components: config.ComponentMap{
+					"openbao": {},
+					"tailscale": {
+						Config: map[string]any{
+							"enabled":             true,
+							"oauth_client_id":     "test-client-id",
+							"oauth_client_secret": "test-client-secret",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid - tailscale enabled with secret references",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				DNS: &config.DNSConfig{
+					InfrastructureZones: []config.DNSZone{{Name: "infra.example.com"}},
+					KubernetesZones:     []config.DNSZone{{Name: "k8s.example.com"}},
+					Backend:             "sqlite",
+					APIKey:              "test-key",
+				},
+				Cluster: config.ClusterConfig{
+					Name:          "test-cluster",
+					PrimaryDomain: "example.com",
+					VIP:           "192.168.1.100",
+				},
+				Hosts: []*host.Host{
+					{Hostname: "test-host", Address: "192.168.1.10", Roles: []string{host.RoleOpenBAO}},
+				},
+				Components: config.ComponentMap{
+					"openbao": {},
+					"tailscale": {
+						Config: map[string]any{
+							"enabled":             true,
+							"oauth_client_id":     "${secret:foundry-core/tailscale:client_id}",
+							"oauth_client_secret": "${secret:foundry-core/tailscale:client_secret}",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "error - tailscale enabled but missing credentials",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				DNS: &config.DNSConfig{
+					InfrastructureZones: []config.DNSZone{{Name: "infra.example.com"}},
+					KubernetesZones:     []config.DNSZone{{Name: "k8s.example.com"}},
+					Backend:             "sqlite",
+					APIKey:              "test-key",
+				},
+				Cluster: config.ClusterConfig{
+					Name:          "test-cluster",
+					PrimaryDomain: "example.com",
+					VIP:           "192.168.1.100",
+				},
+				Hosts: []*host.Host{
+					{Hostname: "test-host", Address: "192.168.1.10", Roles: []string{host.RoleOpenBAO}},
+				},
+				Components: config.ComponentMap{
+					"openbao": {},
+					"tailscale": {
+						Config: map[string]any{
+							"enabled": true,
+						},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "Tailscale is enabled but OAuth credentials are missing",
+		},
+		{
+			name: "valid - tailscale disabled",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				DNS: &config.DNSConfig{
+					InfrastructureZones: []config.DNSZone{{Name: "infra.example.com"}},
+					KubernetesZones:     []config.DNSZone{{Name: "k8s.example.com"}},
+					Backend:             "sqlite",
+					APIKey:              "test-key",
+				},
+				Cluster: config.ClusterConfig{
+					Name:          "test-cluster",
+					PrimaryDomain: "example.com",
+					VIP:           "192.168.1.100",
+				},
+				Hosts: []*host.Host{
+					{Hostname: "test-host", Address: "192.168.1.10", Roles: []string{host.RoleOpenBAO}},
+				},
+				Components: config.ComponentMap{
+					"openbao": {},
+					"tailscale": {
+						Config: map[string]any{
+							"enabled": false,
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTailscaleConfig(tt.cfg)
+			if tt.wantErr {
+				assert.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
