@@ -204,3 +204,224 @@ components:
 	// Check that dependencies are shown in output
 	assert.Contains(t, output, "depends on")
 }
+
+func TestInstallCommand_K3sDryRun(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", oldHome)
+
+	foundryDir := filepath.Join(tmpDir, ".foundry")
+	err := os.MkdirAll(foundryDir, 0755)
+	require.NoError(t, err)
+
+	configPath := filepath.Join(foundryDir, "stack.yaml")
+	configContent := `cluster:
+  name: test-cluster
+  primary_domain: test.local
+  vip: 192.168.1.100
+network:
+  gateway: 192.168.1.1
+  netmask: 255.255.255.0
+hosts:
+  - hostname: test-cp
+    address: 192.168.1.10
+    port: 22
+    user: root
+    roles:
+      - cluster-control-plane
+      - openbao
+      - dns
+      - zot
+  - hostname: test-worker
+    address: 192.168.1.11
+    port: 22
+    user: root
+    roles:
+      - cluster-worker
+dns:
+  backend: gsqlite3
+  api_key: test-api-key
+  infrastructure_zones:
+    - name: infra.local
+  kubernetes_zones:
+    - name: k8s.local
+components:
+  openbao:
+    installed: true
+  dns:
+    installed: true
+  zot:
+    installed: true
+  k3s:
+    installed: true
+setup_state:
+  openbao_installed: true
+  dns_installed: true
+  zot_installed: true
+  k8s_installed: true
+`
+	err = os.WriteFile(configPath, []byte(configContent), 0644)
+	require.NoError(t, err)
+
+	testRegistry := component.NewRegistry()
+	oldRegistry := component.DefaultRegistry
+	component.DefaultRegistry = testRegistry
+	defer func() { component.DefaultRegistry = oldRegistry }()
+
+	err = registry.InitComponents()
+	require.NoError(t, err)
+
+	tests := []struct {
+		name         string
+		args         []string
+		expectOutput []string
+	}{
+		{
+			name:         "k3s dry-run single node",
+			args:         []string{"test", "--config", configPath, "install", "k3s", "--dry-run"},
+			expectOutput: []string{"Would reconcile node", "test-cp"},
+		},
+		{
+			name:         "k3s dry-run all nodes",
+			args:         []string{"test", "--config", configPath, "install", "k3s", "--dry-run", "--all-nodes"},
+			expectOutput: []string{"Would reconcile registries.yaml on 2 cluster nodes", "test-cp", "test-worker"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldStdout := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+
+			cmd := &cli.Command{
+				Name: "test",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "config",
+						Aliases: []string{"c"},
+						Usage:   "path to config file",
+					},
+				},
+				Commands: []*cli.Command{
+					InstallCommand,
+				},
+			}
+
+			err := cmd.Run(context.Background(), tt.args)
+
+			w.Close()
+			os.Stdout = oldStdout
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			output := buf.String()
+
+			assert.NoError(t, err)
+			for _, expected := range tt.expectOutput {
+				assert.Contains(t, output, expected, "expected output to contain: %s", expected)
+			}
+		})
+	}
+}
+
+func TestInstallCommand_K3sAllNodesFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", oldHome)
+
+	foundryDir := filepath.Join(tmpDir, ".foundry")
+	err := os.MkdirAll(foundryDir, 0755)
+	require.NoError(t, err)
+
+	configPath := filepath.Join(foundryDir, "stack.yaml")
+	configContent := `cluster:
+  name: test-cluster
+  primary_domain: test.local
+  vip: 192.168.1.100
+hosts:
+  - hostname: cp1
+    address: 192.168.1.10
+    port: 22
+    user: root
+    roles:
+      - cluster-control-plane
+      - openbao
+      - dns
+      - zot
+  - hostname: worker1
+    address: 192.168.1.11
+    port: 22
+    user: root
+    roles:
+      - cluster-worker
+  - hostname: worker2
+    address: 192.168.1.12
+    port: 22
+    user: root
+    roles:
+      - cluster-worker
+dns:
+  backend: gsqlite3
+  api_key: test-api-key
+components:
+  openbao:
+    installed: true
+  dns:
+    installed: true
+  zot:
+    installed: true
+  k3s:
+    installed: true
+setup_state:
+  openbao_installed: true
+  dns_installed: true
+  zot_installed: true
+  k8s_installed: true
+`
+	err = os.WriteFile(configPath, []byte(configContent), 0644)
+	require.NoError(t, err)
+
+	testRegistry := component.NewRegistry()
+	oldRegistry := component.DefaultRegistry
+	component.DefaultRegistry = testRegistry
+	defer func() { component.DefaultRegistry = oldRegistry }()
+
+	err = registry.InitComponents()
+	require.NoError(t, err)
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	cmd := &cli.Command{
+		Name: "test",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "config",
+				Aliases: []string{"c"},
+				Usage:   "path to config file",
+			},
+		},
+		Commands: []*cli.Command{
+			InstallCommand,
+		},
+	}
+
+	err = cmd.Run(context.Background(), []string{"test", "--config", configPath, "install", "k3s", "--dry-run", "--all-nodes"})
+
+	w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	assert.NoError(t, err)
+	assert.Contains(t, output, "3 cluster nodes")
+	assert.Contains(t, output, "cp1")
+	assert.Contains(t, output, "worker1")
+	assert.Contains(t, output, "worker2")
+}

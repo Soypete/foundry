@@ -17,6 +17,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/gatewayapi"
 	"github.com/catalystcommunity/foundry/v1/internal/component/gatewaycontroller"
 	"github.com/catalystcommunity/foundry/v1/internal/component/grafana"
+	"github.com/catalystcommunity/foundry/v1/internal/component/k3s"
 	"github.com/catalystcommunity/foundry/v1/internal/component/loki"
 	"github.com/catalystcommunity/foundry/v1/internal/component/openbao"
 	"github.com/catalystcommunity/foundry/v1/internal/component/openbaoinjector"
@@ -51,6 +52,10 @@ func (a *sshExecutorAdapter) Execute(cmd string) (string, error) {
 	return result.Stdout, nil
 }
 
+func (a *sshExecutorAdapter) Exec(cmd string) (*ssh.ExecResult, error) {
+	return a.conn.Exec(cmd)
+}
+
 // InstallCommand installs a component
 var InstallCommand = &cli.Command{
 	Name:      "install",
@@ -83,6 +88,11 @@ Examples:
 		&cli.StringFlag{
 			Name:  "version",
 			Usage: "Override the version to install",
+		},
+		// K3s-specific flags
+		&cli.BoolFlag{
+			Name:  "all-nodes",
+			Usage: "Apply configuration to all cluster nodes (for k3s component)",
 		},
 		// Storage-specific flags
 		&cli.StringFlag{
@@ -565,6 +575,56 @@ func createOpenBAOClient(stackConfig *config.Config) (*openbao.Client, error) {
 
 // installSSHComponent installs a container-based component via SSH
 func installSSHComponent(ctx context.Context, cmd *cli.Command, name string, stackConfig *config.Config, dryRun bool, version string) error {
+	// Handle k3s-specific configuration early (before dry-run check)
+	if name == "k3s" || name == "kubernetes" {
+		// Get component from registry to validate it exists
+		comp := component.Get(name)
+		if comp == nil {
+			return component.ErrComponentNotFound(name)
+		}
+
+		// Get target host for SSH connection
+		targetHost, err := getTargetHostForComponent(name, stackConfig)
+		if err != nil {
+			return fmt.Errorf("failed to determine target host: %w", err)
+		}
+
+		fmt.Printf("Target host: %s (%s)\n", targetHost.Hostname, targetHost.Address)
+
+		// If dry-run, we need to establish connection to show the message
+		// but won't actually run commands
+		if dryRun {
+			allNodes := cmd.Bool("all-nodes")
+			// For dry-run, we can skip SSH connection and just show what would happen
+			cpHosts := stackConfig.GetClusterControlPlaneHosts()
+			workerHosts := stackConfig.GetClusterWorkerHosts()
+			allHosts := append(cpHosts, workerHosts...)
+
+			if allNodes {
+				fmt.Printf("\nWould reconcile registries.yaml on %d cluster nodes...\n", len(allHosts))
+				for _, h := range allHosts {
+					fmt.Printf("  - %s (%s)\n", h.Hostname, h.Address)
+				}
+			} else {
+				fmt.Printf("\nWould reconcile node: %s (%s)\n", targetHost.Hostname, targetHost.Address)
+			}
+			fmt.Println("\nNote: This is a dry-run. No changes will be made.")
+			return nil
+		}
+
+		// Establish SSH connection for actual installation
+		conn, err := connectToHost(targetHost, stackConfig)
+		if err != nil {
+			return fmt.Errorf("failed to connect to host: %w", err)
+		}
+		defer conn.Close()
+		fmt.Println("✓ Connected")
+
+		executor := &sshExecutorAdapter{conn: conn}
+		allNodes := cmd.Bool("all-nodes")
+		return installK3sComponent(ctx, stackConfig, *executor, dryRun, allNodes)
+	}
+
 	// Determine target host for this component
 	targetHost, err := getTargetHostForComponent(name, stackConfig)
 	if err != nil {
@@ -667,6 +727,12 @@ func installSSHComponent(ctx context.Context, cmd *cli.Command, name string, sta
 		}
 	}
 
+	// Handle k3s-specific configuration
+	if name == "k3s" || name == "kubernetes" {
+		allNodes := cmd.Bool("all-nodes")
+		return installK3sComponent(ctx, stackConfig, *executor, dryRun, allNodes)
+	}
+
 	fmt.Printf("\nInstalling component: %s\n", name)
 
 	// Install component
@@ -692,6 +758,97 @@ func installSSHComponent(ctx context.Context, cmd *cli.Command, name string, sta
 		fmt.Println("The component is installed and working, but DNS records may need manual creation.")
 	}
 
+	return nil
+}
+
+// installK3sComponent handles k3s component installation/repair via SSH
+// It configures registries.yaml and other node-level settings
+func installK3sComponent(ctx context.Context, stackConfig *config.Config, executor sshExecutorAdapter, dryRun bool, allNodes bool) error {
+	// Get cluster hosts
+	cpHosts := stackConfig.GetClusterControlPlaneHosts()
+	workerHosts := stackConfig.GetClusterWorkerHosts()
+	allHosts := append(cpHosts, workerHosts...)
+
+	if len(allHosts) == 0 {
+		return fmt.Errorf("no cluster hosts configured")
+	}
+
+	if allNodes {
+		// Reconcile all cluster nodes
+		fmt.Printf("Reconciling registries.yaml on %d cluster nodes...\n", len(allHosts))
+		for _, h := range allHosts {
+			fmt.Printf("\nProcessing node: %s (%s)\n", h.Hostname, h.Address)
+			if err := reconcileK3sNode(ctx, stackConfig, h, executor, dryRun); err != nil {
+				return fmt.Errorf("failed to reconcile node %s: %w", h.Hostname, err)
+			}
+		}
+		fmt.Println("\n✓ All nodes reconciled")
+	} else {
+		// Default: process first control plane node
+		targetHost := cpHosts[0]
+		fmt.Printf("Processing node: %s (%s)\n", targetHost.Hostname, targetHost.Address)
+		if err := reconcileK3sNode(ctx, stackConfig, targetHost, executor, dryRun); err != nil {
+			return fmt.Errorf("failed to process node %s: %w", targetHost.Hostname, err)
+		}
+	}
+
+	return nil
+}
+
+// reconcileK3sNode reconciles a single k3s node's configuration
+func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.Host, executor sshExecutorAdapter, dryRun bool) error {
+	// Build k3s config
+	k3sConfig := &k3s.Config{
+		VIP:       stackConfig.Cluster.VIP,
+		Interface: h.Address,
+	}
+
+	// Parse additional registries from component config
+	if k3sCompCfg, exists := stackConfig.Components["k3s"]; exists {
+		k3sConfig.AdditionalRegistries = k3s.ParseAdditionalRegistries(k3sCompCfg.Config)
+	}
+
+	// Populate registry config if Zot is configured
+	zotAddr, err := stackConfig.GetPrimaryZotAddress()
+	if err == nil && zotAddr != "" {
+		k3s.PopulateRegistryConfig(k3sConfig, zotAddr)
+	} else if stackConfig.SetupState != nil && stackConfig.SetupState.ZotInstalled {
+		// Zot is installed but we couldn't get address - warn
+		fmt.Printf("  ⚠ Warning: Zot is installed but could not get Zot address for registry config\n")
+	}
+
+	// Warn if Zot is configured but RegistryConfig is empty
+	if k3sConfig.RegistryConfig == "" && stackConfig.SetupState != nil && stackConfig.SetupState.ZotInstalled {
+		fmt.Printf("  ⚠ Warning: Zot is configured but RegistryConfig is empty - registries.yaml will not be written\n")
+	}
+
+	if dryRun {
+		fmt.Println("  [dry-run] Would apply k3s configuration:")
+		if k3sConfig.RegistryConfig != "" {
+			fmt.Println("    - registries.yaml configuration present")
+		} else {
+			fmt.Println("    - no registries.yaml configuration")
+		}
+		return nil
+	}
+
+	// Check if k3s is installed
+	isInstalled, err := k3s.IsK3sInstalled(&executor)
+	if err != nil {
+		return fmt.Errorf("failed to check k3s status: %w", err)
+	}
+
+	if !isInstalled {
+		return fmt.Errorf("k3s is not installed on node %s - use 'foundry stack install' to install k3s", h.Hostname)
+	}
+
+	// Use the idempotent update path
+	fmt.Println("  Applying k3s configuration (idempotent update)...")
+	if err := k3s.UpdateK3sConfig(ctx, &executor, k3sConfig); err != nil {
+		return fmt.Errorf("failed to update k3s config: %w", err)
+	}
+
+	fmt.Printf("  ✓ Configuration applied to %s\n", h.Hostname)
 	return nil
 }
 
@@ -1011,9 +1168,12 @@ func getTargetHostForComponent(componentName string, stackConfig *config.Config)
 		}
 	case "k3s", "kubernetes":
 		// K3s is installed on nodes defined by cluster roles
-		// For now, use the first control plane node
-		// TODO: Implement proper node selection for K3s
-		return nil, fmt.Errorf("k3s installation not yet implemented in component install command")
+		// Use the first control plane node for single-node install/ repair
+		cpHosts := stackConfig.GetClusterControlPlaneHosts()
+		if len(cpHosts) == 0 {
+			return nil, fmt.Errorf("no control plane host configured for k3s")
+		}
+		targetHost = cpHosts[0]
 	default:
 		return nil, fmt.Errorf("unknown component %q - cannot determine target host", componentName)
 	}

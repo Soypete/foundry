@@ -95,6 +95,16 @@ func GenerateRegistriesConfig(zotAddr string, additional []AdditionalRegistry) s
 	return GenerateRegistriesYAML(zotURL, true, additional)
 }
 
+// PopulateRegistryConfig populates the RegistryConfig field in k3s.Config
+// if Zot is configured in the stack. It returns the populated config.
+// This should be called when building k3s.Config for install/repair operations.
+func PopulateRegistryConfig(cfg *Config, zotAddr string) {
+	if zotAddr == "" {
+		return
+	}
+	cfg.RegistryConfig = GenerateRegistriesConfig(zotAddr, cfg.AdditionalRegistries)
+}
+
 // GenerateK3sServerFlags generates the command-line flags for K3s server installation
 func GenerateK3sServerFlags(cfg *Config) []string {
 	flags := []string{}
