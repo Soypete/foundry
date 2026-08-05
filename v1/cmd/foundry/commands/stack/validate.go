@@ -44,6 +44,7 @@ func runStackValidate(ctx context.Context, cmd *cli.Command) error {
 		{"VIP configuration", validateVIPConfig},
 		{"Cluster configuration", validateClusterConfig},
 		{"Component dependencies", validateComponentDependencies},
+		{"Tailscale configuration", validateTailscaleConfig},
 	}
 
 	for _, v := range validations {
@@ -193,6 +194,39 @@ func validateComponentDependencies(cfg *config.Config) error {
 	if len(order) != len(componentNames) {
 		return fmt.Errorf("dependency resolution incomplete: expected %d components, got %d",
 			len(componentNames), len(order))
+	}
+
+	return nil
+}
+
+// validateTailscaleConfig validates Tailscale configuration if enabled
+func validateTailscaleConfig(cfg *config.Config) error {
+	// Check if Tailscale is configured
+	if cfg.Components == nil {
+		return nil
+	}
+
+	tsCfg, exists := cfg.Components["tailscale"]
+	if !exists {
+		return nil
+	}
+
+	// Check if enabled (default to true if config exists but no enabled field)
+	enabled := true
+	if enabledVal, ok := tsCfg.Config["enabled"].(bool); ok {
+		enabled = enabledVal
+	}
+
+	if !enabled {
+		return nil
+	}
+
+	// Tailscale is enabled - check for OAuth credentials
+	clientID, hasClientID := tsCfg.Config["oauth_client_id"].(string)
+	clientSecret, hasClientSecret := tsCfg.Config["oauth_client_secret"].(string)
+
+	if !hasClientID || !hasClientSecret || clientID == "" || clientSecret == "" {
+		return fmt.Errorf("Tailscale is enabled but OAuth credentials are missing. To create OAuth credentials, visit: %s", tailscaleDocsURL)
 	}
 
 	return nil
