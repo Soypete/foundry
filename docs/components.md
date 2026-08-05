@@ -71,7 +71,11 @@ foundry component install k3s --dry-run
 The `component install k3s` command:
 - Populates `/etc/rancher/k3s/registries.yaml` with Zot registry configuration
 - Idempotent: only restarts K3s if configuration actually changes
-- Works for both new installations and repairing existing nodes
+- Connects to each node individually, so `--all-nodes` reconciles workers too
+
+This command reconciles configuration on nodes where K3s is **already
+installed**; it errors out if K3s is missing. To install K3s on a new node, use
+`foundry stack install`.
 
 ### kube-vip
 

@@ -122,8 +122,8 @@ func TestPopulateRegistryConfig(t *testing.T) {
 			wantEmpty: true,
 		},
 		{
-			name:      "nil zot address produces empty config",
-			zotAddr:   "",
+			name:      "whitespace-only zot address is treated as empty",
+			zotAddr:   "   ",
 			wantEmpty: true,
 		},
 		{

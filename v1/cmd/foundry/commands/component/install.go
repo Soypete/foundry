@@ -583,7 +583,7 @@ func installSSHComponent(ctx context.Context, cmd *cli.Command, name string, sta
 			return component.ErrComponentNotFound(name)
 		}
 
-		// Get target host for SSH connection
+		// Validate a control plane node exists before doing any work
 		targetHost, err := getTargetHostForComponent(name, stackConfig)
 		if err != nil {
 			return fmt.Errorf("failed to determine target host: %w", err)
@@ -591,38 +591,16 @@ func installSSHComponent(ctx context.Context, cmd *cli.Command, name string, sta
 
 		fmt.Printf("Target host: %s (%s)\n", targetHost.Hostname, targetHost.Address)
 
-		// If dry-run, we need to establish connection to show the message
-		// but won't actually run commands
-		if dryRun {
-			allNodes := cmd.Bool("all-nodes")
-			// For dry-run, we can skip SSH connection and just show what would happen
-			cpHosts := stackConfig.GetClusterControlPlaneHosts()
-			workerHosts := stackConfig.GetClusterWorkerHosts()
-			allHosts := append(cpHosts, workerHosts...)
-
-			if allNodes {
-				fmt.Printf("\nWould reconcile registries.yaml on %d cluster nodes...\n", len(allHosts))
-				for _, h := range allHosts {
-					fmt.Printf("  - %s (%s)\n", h.Hostname, h.Address)
-				}
-			} else {
-				fmt.Printf("\nWould reconcile node: %s (%s)\n", targetHost.Hostname, targetHost.Address)
-			}
-			fmt.Println("\nNote: This is a dry-run. No changes will be made.")
-			return nil
-		}
-
-		// Establish SSH connection for actual installation
-		conn, err := connectToHost(targetHost, stackConfig)
-		if err != nil {
-			return fmt.Errorf("failed to connect to host: %w", err)
-		}
-		defer conn.Close()
-		fmt.Println("✓ Connected")
-
-		executor := &sshExecutorAdapter{conn: conn}
+		// Dry-run takes the same path so the printed plan reflects the hosts
+		// that would really be contacted; the connector is never invoked.
 		allNodes := cmd.Bool("all-nodes")
-		return installK3sComponent(ctx, stackConfig, *executor, dryRun, allNodes)
+		if err := installK3sComponent(ctx, stackConfig, sshNodeConnector(stackConfig), dryRun, allNodes); err != nil {
+			return err
+		}
+		if dryRun {
+			fmt.Println("\nNote: This is a dry-run. No changes will be made.")
+		}
+		return nil
 	}
 
 	// Determine target host for this component
@@ -727,12 +705,6 @@ func installSSHComponent(ctx context.Context, cmd *cli.Command, name string, sta
 		}
 	}
 
-	// Handle k3s-specific configuration
-	if name == "k3s" || name == "kubernetes" {
-		allNodes := cmd.Bool("all-nodes")
-		return installK3sComponent(ctx, stackConfig, *executor, dryRun, allNodes)
-	}
-
 	fmt.Printf("\nInstalling component: %s\n", name)
 
 	// Install component
@@ -761,46 +733,104 @@ func installSSHComponent(ctx context.Context, cmd *cli.Command, name string, sta
 	return nil
 }
 
-// installK3sComponent handles k3s component installation/repair via SSH
-// It configures registries.yaml and other node-level settings
-func installK3sComponent(ctx context.Context, stackConfig *config.Config, executor sshExecutorAdapter, dryRun bool, allNodes bool) error {
-	// Get cluster hosts
+// k3sNodeConnector opens an executor for a single cluster node. The returned
+// close func releases the underlying connection. Injected so tests can drive
+// installK3sComponent without real SSH.
+type k3sNodeConnector func(h *host.Host) (k3s.SSHExecutor, func(), error)
+
+// sshNodeConnector is the production connector: it dials each node over SSH.
+func sshNodeConnector(stackConfig *config.Config) k3sNodeConnector {
+	return func(h *host.Host) (k3s.SSHExecutor, func(), error) {
+		conn, err := connectToHost(h, stackConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &sshExecutorAdapter{conn: conn}, func() { conn.Close() }, nil
+	}
+}
+
+// k3sClusterHosts returns every cluster node (control plane first, then workers).
+func k3sClusterHosts(stackConfig *config.Config) []*host.Host {
 	cpHosts := stackConfig.GetClusterControlPlaneHosts()
 	workerHosts := stackConfig.GetClusterWorkerHosts()
-	allHosts := append(cpHosts, workerHosts...)
+
+	// Copy rather than append onto cpHosts, whose backing array may have spare
+	// capacity that append would overwrite.
+	allHosts := make([]*host.Host, 0, len(cpHosts)+len(workerHosts))
+	allHosts = append(allHosts, cpHosts...)
+	allHosts = append(allHosts, workerHosts...)
+	return allHosts
+}
+
+// installK3sComponent handles k3s component installation/repair via SSH
+// It configures registries.yaml and other node-level settings.
+// Each node is contacted over its own connection, so --all-nodes genuinely
+// reconciles workers rather than repeating work on the control plane.
+func installK3sComponent(ctx context.Context, stackConfig *config.Config, connect k3sNodeConnector, dryRun bool, allNodes bool) error {
+	cpHosts := stackConfig.GetClusterControlPlaneHosts()
+	allHosts := k3sClusterHosts(stackConfig)
 
 	if len(allHosts) == 0 {
 		return fmt.Errorf("no cluster hosts configured")
 	}
 
+	targets := allHosts
+	if !allNodes {
+		// Default: process first control plane node only
+		if len(cpHosts) == 0 {
+			return fmt.Errorf("no control plane host configured for k3s")
+		}
+		targets = cpHosts[:1]
+	}
+
 	if allNodes {
-		// Reconcile all cluster nodes
-		fmt.Printf("Reconciling registries.yaml on %d cluster nodes...\n", len(allHosts))
-		for _, h := range allHosts {
+		verb := "Reconciling"
+		if dryRun {
+			verb = "Would reconcile"
+		}
+		fmt.Printf("%s registries.yaml on %d cluster nodes...\n", verb, len(targets))
+	}
+
+	for _, h := range targets {
+		if dryRun {
+			fmt.Printf("\nWould reconcile node: %s (%s)\n", h.Hostname, h.Address)
+		} else {
 			fmt.Printf("\nProcessing node: %s (%s)\n", h.Hostname, h.Address)
-			if err := reconcileK3sNode(ctx, stackConfig, h, executor, dryRun); err != nil {
-				return fmt.Errorf("failed to reconcile node %s: %w", h.Hostname, err)
-			}
 		}
+		if err := reconcileK3sNodeWithConnector(ctx, stackConfig, h, connect, dryRun); err != nil {
+			return fmt.Errorf("failed to reconcile node %s: %w", h.Hostname, err)
+		}
+	}
+
+	if allNodes && !dryRun {
 		fmt.Println("\n✓ All nodes reconciled")
-	} else {
-		// Default: process first control plane node
-		targetHost := cpHosts[0]
-		fmt.Printf("Processing node: %s (%s)\n", targetHost.Hostname, targetHost.Address)
-		if err := reconcileK3sNode(ctx, stackConfig, targetHost, executor, dryRun); err != nil {
-			return fmt.Errorf("failed to process node %s: %w", targetHost.Hostname, err)
-		}
 	}
 
 	return nil
 }
 
-// reconcileK3sNode reconciles a single k3s node's configuration
-func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.Host, executor sshExecutorAdapter, dryRun bool) error {
-	// Build k3s config
+// reconcileK3sNodeWithConnector opens a per-node connection and reconciles it.
+// Dry-run needs no connection, so none is opened.
+func reconcileK3sNodeWithConnector(ctx context.Context, stackConfig *config.Config, h *host.Host, connect k3sNodeConnector, dryRun bool) error {
+	if dryRun {
+		return reconcileK3sNode(ctx, stackConfig, h, nil, true)
+	}
+
+	executor, closeConn, err := connect(h)
+	if err != nil {
+		return fmt.Errorf("failed to connect to host %s: %w", h.Hostname, err)
+	}
+	defer closeConn()
+
+	return reconcileK3sNode(ctx, stackConfig, h, executor, false)
+}
+
+// buildK3sNodeConfig assembles the k3s.Config applied to a node.
+// Interface is deliberately left unset: it names a NIC (e.g. eth0), not an
+// address, and is detected on the node itself when kube-vip needs it.
+func buildK3sNodeConfig(stackConfig *config.Config) *k3s.Config {
 	k3sConfig := &k3s.Config{
-		VIP:       stackConfig.Cluster.VIP,
-		Interface: h.Address,
+		VIP: stackConfig.Cluster.VIP,
 	}
 
 	// Parse additional registries from component config
@@ -813,14 +843,18 @@ func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.H
 	if err == nil && zotAddr != "" {
 		k3s.PopulateRegistryConfig(k3sConfig, zotAddr)
 	} else if stackConfig.SetupState != nil && stackConfig.SetupState.ZotInstalled {
-		// Zot is installed but we couldn't get address - warn
-		fmt.Printf("  ⚠ Warning: Zot is installed but could not get Zot address for registry config\n")
+		// Zot is installed but its address is unresolvable, so registries.yaml
+		// cannot be written for this node.
+		fmt.Printf("  ⚠ Warning: Zot is installed but its address could not be resolved - registries.yaml will not be written\n")
 	}
 
-	// Warn if Zot is configured but RegistryConfig is empty
-	if k3sConfig.RegistryConfig == "" && stackConfig.SetupState != nil && stackConfig.SetupState.ZotInstalled {
-		fmt.Printf("  ⚠ Warning: Zot is configured but RegistryConfig is empty - registries.yaml will not be written\n")
-	}
+	return k3sConfig
+}
+
+// reconcileK3sNode reconciles a single k3s node's configuration.
+// executor must be connected to h; it may be nil when dryRun is true.
+func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.Host, executor k3s.SSHExecutor, dryRun bool) error {
+	k3sConfig := buildK3sNodeConfig(stackConfig)
 
 	if dryRun {
 		fmt.Println("  [dry-run] Would apply k3s configuration:")
@@ -833,7 +867,7 @@ func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.H
 	}
 
 	// Check if k3s is installed
-	isInstalled, err := k3s.IsK3sInstalled(&executor)
+	isInstalled, err := k3s.IsK3sInstalled(executor)
 	if err != nil {
 		return fmt.Errorf("failed to check k3s status: %w", err)
 	}
@@ -844,7 +878,7 @@ func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.H
 
 	// Use the idempotent update path
 	fmt.Println("  Applying k3s configuration (idempotent update)...")
-	if err := k3s.UpdateK3sConfig(ctx, &executor, k3sConfig); err != nil {
+	if err := k3s.UpdateK3sConfig(ctx, executor, k3sConfig); err != nil {
 		return fmt.Errorf("failed to update k3s config: %w", err)
 	}
 

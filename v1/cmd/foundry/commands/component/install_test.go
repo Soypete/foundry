@@ -3,13 +3,20 @@ package component
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/catalystcommunity/foundry/v1/cmd/foundry/registry"
 	"github.com/catalystcommunity/foundry/v1/internal/component"
+	"github.com/catalystcommunity/foundry/v1/internal/component/k3s"
+	"github.com/catalystcommunity/foundry/v1/internal/config"
+	"github.com/catalystcommunity/foundry/v1/internal/host"
+	"github.com/catalystcommunity/foundry/v1/internal/setup"
+	"github.com/catalystcommunity/foundry/v1/internal/ssh"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v3"
@@ -424,4 +431,267 @@ setup_state:
 	assert.Contains(t, output, "cp1")
 	assert.Contains(t, output, "worker1")
 	assert.Contains(t, output, "worker2")
+}
+
+// fakeK3sExecutor records the commands issued to a single node.
+type fakeK3sExecutor struct {
+	hostname string
+	commands []string
+	// existingRegistries is returned for `cat .../registries.yaml`.
+	existingRegistries string
+	// k3sActive controls whether k3s reports as installed.
+	k3sActive bool
+	// execErr, when set, is returned for any command matching failOn.
+	failOn  string
+	execErr error
+}
+
+func (f *fakeK3sExecutor) Exec(command string) (*ssh.ExecResult, error) {
+	f.commands = append(f.commands, command)
+
+	if f.failOn != "" && strings.Contains(command, f.failOn) {
+		if f.execErr != nil {
+			return nil, f.execErr
+		}
+		return &ssh.ExecResult{ExitCode: 1, Stderr: "command failed"}, nil
+	}
+
+	switch {
+	case strings.Contains(command, "systemctl is-active k3s"):
+		if !f.k3sActive {
+			return &ssh.ExecResult{ExitCode: 3, Stdout: "inactive"}, nil
+		}
+		return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
+	case strings.Contains(command, "cat /etc/rancher/k3s/registries.yaml"):
+		return &ssh.ExecResult{ExitCode: 0, Stdout: f.existingRegistries}, nil
+	case strings.Contains(command, "k3s kubectl get nodes"):
+		return &ssh.ExecResult{ExitCode: 0, Stdout: "node Ready"}, nil
+	}
+	return &ssh.ExecResult{ExitCode: 0}, nil
+}
+
+// wroteRegistriesConfig reports whether registries.yaml was written.
+func (f *fakeK3sExecutor) wroteRegistriesConfig() bool {
+	for _, c := range f.commands {
+		if strings.Contains(c, "/etc/rancher/k3s/registries.yaml") && !strings.HasPrefix(strings.TrimSpace(c), "cat ") {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeK3sExecutor) restartedK3s() bool {
+	for _, c := range f.commands {
+		if strings.Contains(c, "systemctl restart k3s") {
+			return true
+		}
+	}
+	return false
+}
+
+// k3sTestHarness builds a connector that hands out one fake executor per host
+// and records the order in which hosts were dialed.
+type k3sTestHarness struct {
+	executors map[string]*fakeK3sExecutor
+	dialed    []string
+	closed    int
+	// connectErrOn makes the connector fail for a given hostname.
+	connectErrOn string
+	// template configures each newly created executor.
+	template func(*fakeK3sExecutor)
+}
+
+func newK3sTestHarness() *k3sTestHarness {
+	return &k3sTestHarness{executors: map[string]*fakeK3sExecutor{}}
+}
+
+func (h *k3sTestHarness) connector() k3sNodeConnector {
+	return func(target *host.Host) (k3s.SSHExecutor, func(), error) {
+		h.dialed = append(h.dialed, target.Hostname)
+		if h.connectErrOn != "" && target.Hostname == h.connectErrOn {
+			return nil, nil, fmt.Errorf("dial failed for %s", target.Hostname)
+		}
+		exec := &fakeK3sExecutor{hostname: target.Hostname, k3sActive: true}
+		if h.template != nil {
+			h.template(exec)
+		}
+		h.executors[target.Hostname] = exec
+		return exec, func() { h.closed++ }, nil
+	}
+}
+
+// k3sTestConfig builds a stack config with one control plane and two workers.
+func k3sTestConfig() *config.Config {
+	return &config.Config{
+		Cluster: config.ClusterConfig{
+			Name: "test-cluster",
+			VIP:  "192.168.1.100",
+		},
+		Hosts: []*host.Host{
+			{Hostname: "cp1", Address: "192.168.1.10", Port: 22, User: "root",
+				Roles: []string{host.RoleClusterControlPlane, host.RoleZot}},
+			{Hostname: "worker1", Address: "192.168.1.11", Port: 22, User: "root",
+				Roles: []string{host.RoleClusterWorker}},
+			{Hostname: "worker2", Address: "192.168.1.12", Port: 22, User: "root",
+				Roles: []string{host.RoleClusterWorker}},
+		},
+		SetupState: &setup.SetupState{ZotInstalled: true},
+	}
+}
+
+// This is the regression test for the bug where --all-nodes reused a single
+// control-plane connection for every host, so workers were never touched.
+func TestInstallK3sComponent_AllNodesConnectsToEachHost(t *testing.T) {
+	harness := newK3sTestHarness()
+	cfg := k3sTestConfig()
+
+	err := installK3sComponent(context.Background(), cfg, harness.connector(), false, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"cp1", "worker1", "worker2"}, harness.dialed,
+		"--all-nodes must open a connection to every cluster node")
+	assert.Equal(t, 3, harness.closed, "every connection must be closed")
+
+	for _, name := range []string{"cp1", "worker1", "worker2"} {
+		exec, ok := harness.executors[name]
+		require.True(t, ok, "expected an executor for %s", name)
+		assert.True(t, exec.wroteRegistriesConfig(),
+			"registries.yaml should be written on %s", name)
+	}
+}
+
+func TestInstallK3sComponent_DefaultTargetsOnlyControlPlane(t *testing.T) {
+	harness := newK3sTestHarness()
+	cfg := k3sTestConfig()
+
+	err := installK3sComponent(context.Background(), cfg, harness.connector(), false, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"cp1"}, harness.dialed,
+		"without --all-nodes only the first control plane node is reconciled")
+	assert.NotContains(t, harness.executors, "worker1")
+}
+
+func TestInstallK3sComponent_DryRunOpensNoConnections(t *testing.T) {
+	harness := newK3sTestHarness()
+	cfg := k3sTestConfig()
+
+	err := installK3sComponent(context.Background(), cfg, harness.connector(), true, true)
+	require.NoError(t, err)
+
+	assert.Empty(t, harness.dialed, "dry-run must not open SSH connections")
+}
+
+func TestInstallK3sComponent_NoClusterHosts(t *testing.T) {
+	harness := newK3sTestHarness()
+	cfg := &config.Config{
+		Cluster: config.ClusterConfig{Name: "empty"},
+		Hosts:   []*host.Host{},
+	}
+
+	err := installK3sComponent(context.Background(), cfg, harness.connector(), false, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no cluster hosts configured")
+}
+
+func TestInstallK3sComponent_ConnectFailureStopsWithHostContext(t *testing.T) {
+	harness := newK3sTestHarness()
+	harness.connectErrOn = "worker1"
+	cfg := k3sTestConfig()
+
+	err := installK3sComponent(context.Background(), cfg, harness.connector(), false, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "worker1", "error should name the failing node")
+
+	// worker2 must not be dialed after worker1 fails.
+	assert.Equal(t, []string{"cp1", "worker1"}, harness.dialed)
+}
+
+func TestInstallK3sComponent_ErrorsWhenK3sNotInstalledOnNode(t *testing.T) {
+	harness := newK3sTestHarness()
+	harness.template = func(e *fakeK3sExecutor) { e.k3sActive = false }
+	cfg := k3sTestConfig()
+
+	err := installK3sComponent(context.Background(), cfg, harness.connector(), false, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "k3s is not installed")
+	assert.Contains(t, err.Error(), "cp1")
+}
+
+// Idempotency at the command layer: a node already holding the desired
+// registries.yaml must not be restarted.
+func TestInstallK3sComponent_SkipsRestartWhenConfigUnchanged(t *testing.T) {
+	cfg := k3sTestConfig()
+
+	// First pass: capture the config that gets written.
+	first := newK3sTestHarness()
+	require.NoError(t, installK3sComponent(context.Background(), cfg, first.connector(), false, false))
+	require.True(t, first.executors["cp1"].restartedK3s(),
+		"a node with no matching config should be restarted")
+
+	// Derive the desired registries.yaml the same way production does.
+	desired := &k3s.Config{}
+	k3s.PopulateRegistryConfig(desired, "192.168.1.10")
+	require.NotEmpty(t, desired.RegistryConfig)
+
+	// Second pass: node already has that exact config.
+	second := newK3sTestHarness()
+	second.template = func(e *fakeK3sExecutor) { e.existingRegistries = desired.RegistryConfig }
+	require.NoError(t, installK3sComponent(context.Background(), cfg, second.connector(), false, false))
+
+	assert.False(t, second.executors["cp1"].restartedK3s(),
+		"k3s must not restart when registries.yaml is unchanged")
+}
+
+// Config.Interface names a NIC (eth0) and is detected on the node; it must
+// never be populated from host.Address. Regression guard.
+func TestBuildK3sNodeConfig_LeavesInterfaceUnset(t *testing.T) {
+	cfg := k3sTestConfig()
+
+	k3sConfig := buildK3sNodeConfig(cfg)
+
+	assert.Empty(t, k3sConfig.Interface,
+		"Interface is a NIC name detected on the node, not an address from config")
+	assert.Equal(t, "192.168.1.100", k3sConfig.VIP)
+	assert.NotEmpty(t, k3sConfig.RegistryConfig,
+		"a reachable Zot host should populate registries.yaml")
+}
+
+func TestReconcileK3sNode_WarnsWhenZotAddressUnresolvable(t *testing.T) {
+	cfg := k3sTestConfig()
+	// Zot marked installed, but no host carries the zot role.
+	cfg.Hosts[0].Roles = []string{host.RoleClusterControlPlane}
+
+	harness := newK3sTestHarness()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := installK3sComponent(context.Background(), cfg, harness.connector(), false, false)
+
+	w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	require.NoError(t, err)
+	assert.Contains(t, output, "Zot is installed but its address could not be resolved")
+	assert.False(t, harness.executors["cp1"].wroteRegistriesConfig(),
+		"no registries.yaml should be written without a Zot address")
+}
+
+func TestK3sClusterHosts_DoesNotMutateControlPlaneSlice(t *testing.T) {
+	cfg := k3sTestConfig()
+
+	cpHosts := cfg.GetClusterControlPlaneHosts()
+	require.Len(t, cpHosts, 1)
+	before := cpHosts[0].Hostname
+
+	all := k3sClusterHosts(cfg)
+	require.Len(t, all, 3)
+
+	assert.Equal(t, before, cfg.GetClusterControlPlaneHosts()[0].Hostname,
+		"building the full host list must not clobber the control plane slice")
 }
