@@ -47,14 +47,17 @@ func ValidStates() []string {
 
 // Host represents a managed host in the infrastructure
 type Host struct {
-	Hostname  string            // Friendly name for the host
-	Address   string            // IP address or FQDN
-	Port      int               // SSH port (default 22)
-	User      string            // SSH user
-	SSHKeySet bool              // Whether an SSH key has been configured for this host
-	Roles     []string          // Component roles (openbao, dns, zot, cluster-control-plane, cluster-worker)
-	State     string            // Host state (added, ssh-configured, configured)
-	Labels    map[string]string // Kubernetes node labels (optional)
+	Hostname         string            // Friendly name for the host
+	Address          string            // IP address or FQDN
+	NodeIP           string            `json:"node_ip,omitempty" yaml:"node_ip,omitempty"`                     // Physical cluster/LAN address; defaults to a non-CGNAT Address when Address is an IP
+	FlannelInterface string            `json:"flannel_interface,omitempty" yaml:"flannel_interface,omitempty"` // Physical interface used for the Flannel underlay
+	TailscaleAddress string            `json:"tailscale_address,omitempty" yaml:"tailscale_address,omitempty"` // Optional remote-management/API address; never used by Flannel
+	Port             int               // SSH port (default 22)
+	User             string            // SSH user
+	SSHKeySet        bool              // Whether an SSH key has been configured for this host
+	Roles            []string          // Component roles (openbao, dns, zot, cluster-control-plane, cluster-worker)
+	State            string            // Host state (added, ssh-configured, configured)
+	Labels           map[string]string // Kubernetes node labels (optional)
 }
 
 // HostRegistry defines the interface for managing hosts
@@ -96,6 +99,15 @@ func (h *Host) Validate() error {
 	// Validate address is either a valid IP or hostname
 	if !isValidAddress(h.Address) {
 		return fmt.Errorf("invalid address format: %s", h.Address)
+	}
+	if h.NodeIP != "" && net.ParseIP(h.NodeIP) == nil {
+		return fmt.Errorf("node_ip must be an IP address: %s", h.NodeIP)
+	}
+	if h.TailscaleAddress != "" && net.ParseIP(h.TailscaleAddress) == nil {
+		return fmt.Errorf("tailscale_address must be an IP address: %s", h.TailscaleAddress)
+	}
+	if h.FlannelInterface != "" && !regexp.MustCompile(`^[a-zA-Z0-9_.:-]+$`).MatchString(h.FlannelInterface) {
+		return fmt.Errorf("invalid flannel_interface: %s", h.FlannelInterface)
 	}
 
 	if h.Port <= 0 || h.Port > 65535 {
@@ -142,6 +154,24 @@ func (h *Host) Validate() error {
 	}
 
 	return nil
+}
+
+// K3sNodeIP returns the address that may safely be used for the K3s data
+// plane. CGNAT is reserved for overlay networks such as Tailscale, so using a
+// 100.64.0.0/10 management address implicitly can break Flannel and etcd.
+func (h *Host) K3sNodeIP() (string, error) {
+	if h.NodeIP != "" {
+		return h.NodeIP, nil
+	}
+	ip := net.ParseIP(h.Address)
+	if ip == nil {
+		return "", fmt.Errorf("node_ip is required when address %q is not an IP address", h.Address)
+	}
+	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
+	if cgnat.Contains(ip) {
+		return "", fmt.Errorf("node_ip is required when address %s is in the Tailscale/CGNAT range 100.64.0.0/10; set node_ip to the node's physical cluster/LAN address", h.Address)
+	}
+	return h.Address, nil
 }
 
 // HasRole checks if the host has a specific role

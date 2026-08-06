@@ -43,6 +43,11 @@ func JoinControlPlane(ctx context.Context, executor SSHExecutor, existingServerU
 
 		// Track if we need to restart K3s
 		needsRestart := false
+		changed, err := updateNetworkConfig(executor, cfg, true)
+		if err != nil {
+			return fmt.Errorf("failed to update k3s network config: %w", err)
+		}
+		needsRestart = needsRestart || changed
 
 		// Update etcd config if configured (for virtualized environments)
 		if len(cfg.EtcdArgs) > 0 {
@@ -97,6 +102,9 @@ func JoinControlPlane(ctx context.Context, executor SSHExecutor, existingServerU
 	}
 
 	// Step 1: Configure DNS (if DNS servers provided)
+	if _, err := updateNetworkConfig(executor, cfg, true); err != nil {
+		return fmt.Errorf("failed to create k3s network config: %w", err)
+	}
 	if len(cfg.DNSServers) > 0 {
 		if err := configureDNS(executor, cfg.DNSServers); err != nil {
 			return fmt.Errorf("failed to configure DNS: %w", err)

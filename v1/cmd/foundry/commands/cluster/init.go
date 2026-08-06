@@ -40,6 +40,31 @@ func convertToK3sNodes(hosts []*host.Host) []k3s.NodeConfig {
 	return k3sNodes
 }
 
+func nodeIPForHost(h *host.Host) string {
+	if h.NodeIP != "" {
+		return h.NodeIP
+	}
+	return h.Address
+}
+
+func applyHostNetwork(h *host.Host, cfg *k3s.Config) {
+	cfg.NodeIP = nodeIPForHost(h)
+	cfg.FlannelIface = h.FlannelInterface
+	if cfg.AdvertiseAddress == "" {
+		cfg.AdvertiseAddress = cfg.NodeIP
+	}
+	if h.TailscaleAddress != "" {
+		cfg.TLSSANs = append(cfg.TLSSANs, h.TailscaleAddress)
+	}
+}
+
+func apiClientAddress(h *host.Host, vip string) string {
+	if h.TailscaleAddress != "" {
+		return h.TailscaleAddress
+	}
+	return vip
+}
+
 func initCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "init",
@@ -201,6 +226,14 @@ func connectToHost(hostname string) (*ssh.Connection, error) {
 // InitializeCluster initializes a Kubernetes cluster with the given configuration.
 // This function is exported so it can be called from other commands like stack install.
 func InitializeCluster(ctx context.Context, cfg *config.Config) error {
+	// Validate data-plane identities before generating credentials or changing
+	// any node. Stack install reaches this path rather than component reconcile.
+	for _, h := range cfg.GetClusterHosts() {
+		if _, err := h.K3sNodeIP(); err != nil {
+			return fmt.Errorf("unsafe k3s network identity for %s: %w", h.Hostname, err)
+		}
+	}
+
 	// Step 1: Load OpenBAO credentials
 	fmt.Println("Loading OpenBAO credentials...")
 
@@ -280,11 +313,15 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 		VIP:          cfg.Cluster.VIP,
 		TLSSANs: []string{
 			cfg.Cluster.VIP,
-			firstHost.Address, // Add control plane's Tailscale IP for direct access
+			firstHost.Address,
 			fmt.Sprintf("%s.%s", cfg.Cluster.Name, cfg.Cluster.PrimaryDomain),
 		},
 		DisableComponents: []string{"traefik", "servicelb"},
 		AllowCGNATVIP:     cfg.Cluster.AllowCGNATVIP,
+	}
+	applyHostNetwork(firstHost, k3sConfig)
+	if err := k3s.ResolveNodeNetwork(conn, k3sConfig); err != nil {
+		return fmt.Errorf("failed to resolve network for %s: %w", firstHost.Hostname, err)
 	}
 
 	// Parse additional registries and etcd args from component config
@@ -319,8 +356,8 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 	time.Sleep(10 * time.Second)
 
 	// Step 7: Join additional control plane nodes
-	// Use control plane node's Tailscale IP, not VIP, for direct node-to-node communication
-	serverURL := fmt.Sprintf("https://%s:6443", firstHost.Address)
+	// Cluster joins use the physical LAN, independently of the API VIP and remote-access plane.
+	serverURL := fmt.Sprintf("https://%s:6443", nodeIPForHost(firstHost))
 	for i := firstCPIndex + 1; i < len(clusterHosts); i++ {
 		role := nodeRoles[i]
 		if !role.IsControlPlane {
@@ -348,6 +385,11 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 			RegistryConfig:    k3sConfig.RegistryConfig,
 			EtcdArgs:          k3sConfig.EtcdArgs,
 			AllowCGNATVIP:     k3sConfig.AllowCGNATVIP,
+		}
+		applyHostNetwork(h, joinConfig)
+		if err := k3s.ResolveNodeNetwork(conn, joinConfig); err != nil {
+			conn.Close()
+			return fmt.Errorf("failed to resolve network for %s: %w", h.Hostname, err)
 		}
 
 		// Join control plane
@@ -383,6 +425,12 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 			ServerURL:      serverURL,
 			AgentToken:     tokens.AgentToken,
 			RegistryConfig: k3sConfig.RegistryConfig,
+			VIP:            cfg.Cluster.VIP,
+		}
+		applyHostNetwork(h, workerConfig)
+		if err := k3s.ResolveNodeNetwork(conn, workerConfig); err != nil {
+			conn.Close()
+			return fmt.Errorf("failed to resolve network for %s: %w", h.Hostname, err)
 		}
 
 		// Join worker
@@ -408,8 +456,8 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 	}
 	defer conn.Close()
 
-	// Use Tailscale IP instead of VIP for kubeconfig - workers need direct access to API server
-	if err := k3s.RetrieveAndStoreKubeconfig(ctx, conn, openbaoClient, firstHost.Address); err != nil {
+	// Remote clients prefer an explicitly configured Tailscale address; otherwise use the API VIP.
+	if err := k3s.RetrieveAndStoreKubeconfig(ctx, conn, openbaoClient, apiClientAddress(firstHost, cfg.Cluster.VIP)); err != nil {
 		return fmt.Errorf("failed to retrieve kubeconfig: %w", err)
 	}
 	fmt.Println("✓ Kubeconfig retrieved and stored in OpenBAO")
@@ -428,7 +476,29 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 
 	// Step 10: Verify cluster health
 	fmt.Println("Verifying cluster health...")
-	// TODO: Implement cluster health check
+	validationNodes := make([]k3s.FlannelNode, 0, len(clusterHosts))
+	peerConnections := make([]*ssh.Connection, 0, len(clusterHosts))
+	for i, h := range clusterHosts {
+		peerHost := clusterHosts[(i+1)%len(clusterHosts)]
+		var peer k3s.SSHExecutor
+		if len(clusterHosts) > 1 {
+			peerConn, connectErr := connectToHost(peerHost.Hostname)
+			if connectErr != nil {
+				return fmt.Errorf("failed to connect to validation peer %s: %w", peerHost.Hostname, connectErr)
+			}
+			peerConnections = append(peerConnections, peerConn)
+			peer = peerConn
+		}
+		validationNodes = append(validationNodes, k3s.FlannelNode{Name: h.Hostname, NodeIP: nodeIPForHost(h), Peer: peer})
+	}
+	defer func() {
+		for _, peer := range peerConnections {
+			peer.Close()
+		}
+	}()
+	if err := k3s.ValidateFlannelPublicIPs(conn, validationNodes, cfg.Cluster.VIP); err != nil {
+		return fmt.Errorf("cluster Flannel validation failed: %w", err)
+	}
 	fmt.Println("✓ Cluster is healthy")
 
 	return nil

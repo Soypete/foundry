@@ -2,11 +2,33 @@ package network
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 
 	"github.com/catalystcommunity/foundry/v1/internal/ssh"
 )
+
+// DetectInterfaceForIP returns the interface that owns the exact configured
+// address. This is stable when a secondary VIP exists, unlike taking the first
+// address returned by the kernel.
+func DetectInterfaceForIP(conn SSHExecutor, ip string) (string, error) {
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("invalid IP address: %s", ip)
+	}
+	result, err := conn.Exec(fmt.Sprintf("ip -o -4 addr show | awk '$4 ~ /^%s\\// {print $2; exit}'", regexp.QuoteMeta(ip)))
+	if err != nil {
+		return "", fmt.Errorf("failed to find interface for %s: %w", ip, err)
+	}
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("failed to find interface for %s: %s", ip, result.Stderr)
+	}
+	iface := strings.TrimSpace(result.Stdout)
+	if iface == "" {
+		return "", fmt.Errorf("configured node IP %s is not assigned to this host", ip)
+	}
+	return iface, nil
+}
 
 // SSHExecutor is an interface for executing SSH commands
 // This allows for easier testing with mocks
