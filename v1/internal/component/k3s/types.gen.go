@@ -8,9 +8,9 @@ type Config struct {
 	Version              string               `json:"version" yaml:"version"`
 	VIP                  string               `json:"vip" yaml:"vip"`
 	Interface            string               `json:"interface" yaml:"interface"`
-	NodeIP               string               `json:"node_ip,omitempty" yaml:"node_ip,omitempty"`
-	FlannelIface         string               `json:"flannel_iface,omitempty" yaml:"flannel_iface,omitempty"`
-	AdvertiseAddress     string               `json:"advertise_address,omitempty" yaml:"advertise_address,omitempty"`
+	NodeIP               string               `json:"node_ip" yaml:"node_ip"`
+	FlannelIface         string               `json:"flannel_iface" yaml:"flannel_iface"`
+	AdvertiseAddress     string               `json:"advertise_address" yaml:"advertise_address"`
 	ClusterToken         string               `json:"cluster_token" yaml:"cluster_token"`
 	AgentToken           string               `json:"agent_token" yaml:"agent_token"`
 	TLSSANs              []string             `json:"tls_sans" yaml:"tls_sans"`
