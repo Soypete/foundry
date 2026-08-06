@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/catalystcommunity/foundry/v1/internal/network"
+	"github.com/catalystcommunity/foundry/v1/internal/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 // RetryConfig holds configuration for retry operations
@@ -299,6 +301,9 @@ func updateNetworkConfig(executor SSHExecutor, cfg *Config, server bool) (bool, 
 	if existing != nil && strings.TrimSpace(existing.Stdout) == strings.TrimSpace(content) {
 		return false, nil
 	}
+	if err := refuseNodeIPChange(executor, existing, cfg.NodeIP); err != nil {
+		return false, err
+	}
 	if result, err := executor.Exec("sudo mkdir -p /etc/rancher/k3s/config.yaml.d"); err != nil || result.ExitCode != 0 {
 		if err != nil {
 			return false, err
@@ -314,6 +319,36 @@ func updateNetworkConfig(executor SSHExecutor, cfg *Config, server bool) (bool, 
 		return false, fmt.Errorf("write exited with code %d", result.ExitCode)
 	}
 	return true, nil
+}
+
+// refuseNodeIPChange protects the identity already recorded in K3s config.
+// Changing it on an initialized server can make the local etcd member no
+// longer match its peer URL, while on workers it silently damages Flannel.
+func refuseNodeIPChange(executor SSHExecutor, generated *ssh.ExecResult, desired string) error {
+	if desired == "" {
+		return nil
+	}
+	current := networkNodeIP(generated)
+	if current == "" {
+		mainConfig, _ := executor.Exec("sudo cat /etc/rancher/k3s/config.yaml 2>/dev/null")
+		current = networkNodeIP(mainConfig)
+	}
+	if current != "" && current != desired {
+		return fmt.Errorf("refusing to change node-ip on an initialized node from %s to %s; update the cluster identity explicitly before reconciling", current, desired)
+	}
+	return nil
+}
+
+func networkNodeIP(result *ssh.ExecResult) string {
+	if result == nil || strings.TrimSpace(result.Stdout) == "" {
+		return ""
+	}
+	var values map[string]interface{}
+	if err := yaml.Unmarshal([]byte(result.Stdout), &values); err != nil {
+		return ""
+	}
+	value, _ := values["node-ip"].(string)
+	return strings.TrimSpace(value)
 }
 
 // configureDNS configures DNS on the node

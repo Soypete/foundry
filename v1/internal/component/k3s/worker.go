@@ -36,43 +36,7 @@ func JoinWorker(ctx context.Context, executor SSHExecutor, serverURL string, tok
 	}
 
 	if isInstalled {
-		// K3s agent is already installed - apply updates idempotently
-		fmt.Println("   K3s agent already installed, applying updates...")
-
-		changed, err := updateNetworkConfig(executor, cfg, false)
-		if err != nil {
-			return fmt.Errorf("failed to update k3s network config: %w", err)
-		}
-		needsRestart := changed
-		// Update registries.yaml if configured (idempotent - only restart if changed)
-		if cfg.RegistryConfig != "" {
-			fmt.Println("   Updating registries.yaml...")
-			// Check if config actually changed before restarting
-			existingResult, _ := executor.Exec("cat /etc/rancher/k3s/registries.yaml 2>/dev/null")
-			existingConfig := ""
-			if existingResult != nil {
-				existingConfig = existingResult.Stdout
-			}
-			if strings.TrimSpace(existingConfig) != strings.TrimSpace(cfg.RegistryConfig) {
-				if err := createRegistriesConfig(executor, cfg.RegistryConfig); err != nil {
-					return fmt.Errorf("failed to update registries config: %w", err)
-				}
-				needsRestart = true
-			} else {
-				fmt.Println("   ✓ registries.yaml unchanged, skipping restart")
-			}
-		}
-		if needsRestart {
-			if _, err := executor.Exec("sudo systemctl restart k3s-agent"); err != nil {
-				return fmt.Errorf("failed to restart k3s-agent: %w", err)
-			}
-			if err := waitForK3sAgentReady(executor, DefaultRetryConfig()); err != nil {
-				return err
-			}
-		}
-
-		fmt.Println("   ✓ Updates applied successfully")
-		return nil
+		return UpdateK3sAgentConfig(ctx, executor, cfg)
 	}
 
 	// Step 1: Configure DNS (if DNS servers provided)
@@ -113,6 +77,45 @@ func JoinWorker(ctx context.Context, executor SSHExecutor, serverURL string, tok
 		return fmt.Errorf("worker node failed to join cluster: %w", err)
 	}
 
+	return nil
+}
+
+// UpdateK3sAgentConfig reconciles an existing worker without treating it as a
+// server. In particular it omits advertise-address and restarts k3s-agent.
+func UpdateK3sAgentConfig(_ context.Context, executor SSHExecutor, cfg *Config) error {
+	fmt.Println("   K3s agent already installed, applying updates...")
+	changed, err := updateNetworkConfig(executor, cfg, false)
+	if err != nil {
+		return fmt.Errorf("failed to update k3s network config: %w", err)
+	}
+	needsRestart := changed
+	if cfg.RegistryConfig != "" {
+		fmt.Println("   Updating registries.yaml...")
+		existingResult, _ := executor.Exec("cat /etc/rancher/k3s/registries.yaml 2>/dev/null")
+		existingConfig := ""
+		if existingResult != nil {
+			existingConfig = existingResult.Stdout
+		}
+		if strings.TrimSpace(existingConfig) != strings.TrimSpace(cfg.RegistryConfig) {
+			if err := createRegistriesConfig(executor, cfg.RegistryConfig); err != nil {
+				return fmt.Errorf("failed to update registries config: %w", err)
+			}
+			needsRestart = true
+		} else {
+			fmt.Println("   ✓ registries.yaml unchanged")
+		}
+	}
+	if needsRestart {
+		if _, err := executor.Exec("sudo systemctl restart k3s-agent"); err != nil {
+			return fmt.Errorf("failed to restart k3s-agent: %w", err)
+		}
+		if err := waitForK3sAgentReady(executor, DefaultRetryConfig()); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("   ✓ No config changes, skipping restart")
+	}
+	fmt.Println("   ✓ Updates applied successfully")
 	return nil
 }
 

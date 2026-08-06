@@ -59,6 +59,12 @@ func GenerateNetworkConfigYAML(cfg *Config, server bool) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+// IndentNetworkConfig formats generated network YAML for dry-run output.
+func IndentNetworkConfig(content, prefix string) string {
+	lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
+	return prefix + strings.Join(lines, "\n"+prefix) + "\n"
+}
+
 // Registry types (RegistryConfig, RegistryMirror, RegistryAuth, etc.) are generated from CSIL in types.gen.go
 
 // GenerateRegistriesYAML generates the registries.yaml content for K3s

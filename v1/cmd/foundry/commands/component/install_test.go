@@ -563,6 +563,10 @@ func TestInstallK3sComponent_AllNodesConnectsToEachHost(t *testing.T) {
 		assert.True(t, exec.wroteRegistriesConfig(),
 			"registries.yaml should be written on %s", name)
 	}
+	for _, name := range []string{"worker1", "worker2"} {
+		assert.Contains(t, harness.executors[name].commands, "sudo systemctl restart k3s-agent",
+			"worker reconcile must restart the agent service")
+	}
 }
 
 func TestInstallK3sComponent_DefaultTargetsOnlyControlPlane(t *testing.T) {
@@ -585,6 +589,27 @@ func TestInstallK3sComponent_DryRunOpensNoConnections(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Empty(t, harness.dialed, "dry-run must not open SSH connections")
+}
+
+func TestReconcileK3sNode_DryRunShowsNetworkConfig(t *testing.T) {
+	cfg := k3sTestConfig()
+	cfg.Hosts[0].NodeIP = "192.168.1.185"
+	cfg.Hosts[0].FlannelInterface = "enp1s0"
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+	err = reconcileK3sNode(context.Background(), cfg, cfg.Hosts[0], nil, true)
+	require.NoError(t, w.Close())
+	os.Stdout = oldStdout
+	var output bytes.Buffer
+	_, copyErr := io.Copy(&output, r)
+	require.NoError(t, copyErr)
+	require.NoError(t, err)
+	assert.Contains(t, output.String(), "node-ip: 192.168.1.185")
+	assert.Contains(t, output.String(), "flannel-iface: enp1s0")
+	assert.Contains(t, output.String(), "advertise-address: 192.168.1.185")
 }
 
 func TestInstallK3sComponent_NoClusterHosts(t *testing.T) {
@@ -654,7 +679,8 @@ func TestInstallK3sComponent_SkipsRestartWhenConfigUnchanged(t *testing.T) {
 func TestBuildK3sNodeConfigSeparatesVIPAndNodeIP(t *testing.T) {
 	cfg := k3sTestConfig()
 
-	k3sConfig := buildK3sNodeConfig(cfg, cfg.Hosts[0])
+	k3sConfig, err := buildK3sNodeConfig(cfg, cfg.Hosts[0])
+	require.NoError(t, err)
 
 	assert.Empty(t, k3sConfig.Interface,
 		"legacy kube-vip Interface must not be populated from an address")
@@ -663,6 +689,16 @@ func TestBuildK3sNodeConfigSeparatesVIPAndNodeIP(t *testing.T) {
 	assert.Equal(t, "192.168.1.100", k3sConfig.VIP)
 	assert.NotEmpty(t, k3sConfig.RegistryConfig,
 		"a reachable Zot host should populate registries.yaml")
+}
+
+func TestBuildK3sNodeConfigRejectsImplicitCGNATNodeIP(t *testing.T) {
+	cfg := k3sTestConfig()
+	cfg.Hosts[0].Address = "100.81.89.62"
+
+	_, err := buildK3sNodeConfig(cfg, cfg.Hosts[0])
+
+	require.ErrorContains(t, err, "node_ip is required")
+	require.ErrorContains(t, err, "100.64.0.0/10")
 }
 
 func TestReconcileK3sNode_WarnsWhenZotAddressUnresolvable(t *testing.T) {

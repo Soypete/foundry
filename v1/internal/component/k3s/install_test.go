@@ -8,6 +8,7 @@ import (
 
 	"github.com/catalystcommunity/foundry/v1/internal/ssh"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockInstallSSHExecutor is a mock for install tests
@@ -626,4 +627,32 @@ func TestUpdateK3sConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUpdateK3sConfigRefusesNodeIPChange(t *testing.T) {
+	wroteNetwork := false
+	restarted := false
+	executor := &mockInstallSSHExecutor{execFunc: func(command string) (*ssh.ExecResult, error) {
+		switch {
+		case strings.Contains(command, "systemctl is-active k3s"):
+			return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
+		case strings.Contains(command, NetworkConfigPath) && strings.Contains(command, "sudo cat"):
+			return &ssh.ExecResult{ExitCode: 1}, nil
+		case strings.Contains(command, "/etc/rancher/k3s/config.yaml"):
+			return &ssh.ExecResult{ExitCode: 0, Stdout: "node-ip: 192.168.1.185\nflannel-iface: enp1s0\n"}, nil
+		case strings.Contains(command, "sudo tee "+NetworkConfigPath):
+			wroteNetwork = true
+		case strings.Contains(command, "systemctl restart k3s"):
+			restarted = true
+		}
+		return &ssh.ExecResult{ExitCode: 0}, nil
+	}}
+
+	err := UpdateK3sConfig(context.Background(), executor, &Config{
+		NodeIP: "100.81.89.62", FlannelIface: "tailscale0", AdvertiseAddress: "100.81.89.62",
+	})
+
+	require.ErrorContains(t, err, "refusing to change node-ip")
+	assert.False(t, wroteNetwork)
+	assert.False(t, restarted)
 }

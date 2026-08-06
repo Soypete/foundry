@@ -226,6 +226,14 @@ func connectToHost(hostname string) (*ssh.Connection, error) {
 // InitializeCluster initializes a Kubernetes cluster with the given configuration.
 // This function is exported so it can be called from other commands like stack install.
 func InitializeCluster(ctx context.Context, cfg *config.Config) error {
+	// Validate data-plane identities before generating credentials or changing
+	// any node. Stack install reaches this path rather than component reconcile.
+	for _, h := range cfg.GetClusterHosts() {
+		if _, err := h.K3sNodeIP(); err != nil {
+			return fmt.Errorf("unsafe k3s network identity for %s: %w", h.Hostname, err)
+		}
+	}
+
 	// Step 1: Load OpenBAO credentials
 	fmt.Println("Loading OpenBAO credentials...")
 

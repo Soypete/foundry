@@ -828,13 +828,14 @@ func reconcileK3sNodeWithConnector(ctx context.Context, stackConfig *config.Conf
 // buildK3sNodeConfig assembles the k3s.Config applied to a node.
 // Interface is deliberately left unset: it names a NIC (e.g. eth0), not an
 // address, and is detected on the node itself when kube-vip needs it.
-func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) *k3s.Config {
-	k3sConfig := &k3s.Config{
-		VIP: stackConfig.Cluster.VIP,
+func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) (*k3s.Config, error) {
+	nodeIP, err := h.K3sNodeIP()
+	if err != nil {
+		return nil, err
 	}
-	k3sConfig.NodeIP = h.NodeIP
-	if k3sConfig.NodeIP == "" {
-		k3sConfig.NodeIP = h.Address
+	k3sConfig := &k3s.Config{
+		VIP:    stackConfig.Cluster.VIP,
+		NodeIP: nodeIP,
 	}
 	k3sConfig.FlannelIface = h.FlannelInterface
 	k3sConfig.AdvertiseAddress = k3sConfig.NodeIP
@@ -854,16 +855,20 @@ func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) *k3s.Config {
 		fmt.Printf("  ⚠ Warning: Zot is installed but its address could not be resolved - registries.yaml will not be written\n")
 	}
 
-	return k3sConfig
+	return k3sConfig, nil
 }
 
 // reconcileK3sNode reconciles a single k3s node's configuration.
 // executor must be connected to h; it may be nil when dryRun is true.
 func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.Host, executor k3s.SSHExecutor, dryRun bool) error {
-	k3sConfig := buildK3sNodeConfig(stackConfig, h)
+	k3sConfig, err := buildK3sNodeConfig(stackConfig, h)
+	if err != nil {
+		return fmt.Errorf("unsafe k3s network identity for %s: %w", h.Hostname, err)
+	}
 
 	if dryRun {
 		fmt.Println("  [dry-run] Would apply k3s configuration:")
+		fmt.Print(k3s.IndentNetworkConfig(k3s.GenerateNetworkConfigYAML(k3sConfig, h.HasRole(host.RoleClusterControlPlane)), "    "))
 		if k3sConfig.RegistryConfig != "" {
 			fmt.Println("    - registries.yaml configuration present")
 		} else {
@@ -872,8 +877,14 @@ func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.H
 		return nil
 	}
 
-	// Check if k3s is installed
-	isInstalled, err := k3s.IsK3sInstalled(executor)
+	isWorker := h.HasRole(host.RoleClusterWorker) && !h.HasRole(host.RoleClusterControlPlane)
+	// Check the correct service for this node role.
+	var isInstalled bool
+	if isWorker {
+		isInstalled, err = k3s.IsK3sAgentInstalled(executor)
+	} else {
+		isInstalled, err = k3s.IsK3sInstalled(executor)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to check k3s status: %w", err)
 	}
@@ -887,7 +898,12 @@ func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.H
 
 	// Use the idempotent update path
 	fmt.Println("  Applying k3s configuration (idempotent update)...")
-	if err := k3s.UpdateK3sConfig(ctx, executor, k3sConfig); err != nil {
+	if isWorker {
+		err = k3s.UpdateK3sAgentConfig(ctx, executor, k3sConfig)
+	} else {
+		err = k3s.UpdateK3sConfig(ctx, executor, k3sConfig)
+	}
+	if err != nil {
 		return fmt.Errorf("failed to update k3s config: %w", err)
 	}
 
