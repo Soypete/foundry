@@ -39,6 +39,11 @@ func JoinWorker(ctx context.Context, executor SSHExecutor, serverURL string, tok
 		// K3s agent is already installed - apply updates idempotently
 		fmt.Println("   K3s agent already installed, applying updates...")
 
+		changed, err := updateNetworkConfig(executor, cfg, false)
+		if err != nil {
+			return fmt.Errorf("failed to update k3s network config: %w", err)
+		}
+		needsRestart := changed
 		// Update registries.yaml if configured (idempotent - only restart if changed)
 		if cfg.RegistryConfig != "" {
 			fmt.Println("   Updating registries.yaml...")
@@ -52,16 +57,17 @@ func JoinWorker(ctx context.Context, executor SSHExecutor, serverURL string, tok
 				if err := createRegistriesConfig(executor, cfg.RegistryConfig); err != nil {
 					return fmt.Errorf("failed to update registries config: %w", err)
 				}
-				// Restart k3s-agent to pick up registry changes
-				if _, err := executor.Exec("sudo systemctl restart k3s-agent"); err != nil {
-					return fmt.Errorf("failed to restart k3s-agent: %w", err)
-				}
-				// Wait for k3s-agent to be ready after restart
-				if err := waitForK3sAgentReady(executor, DefaultRetryConfig()); err != nil {
-					return fmt.Errorf("k3s-agent failed to become ready after restart: %w", err)
-				}
+				needsRestart = true
 			} else {
 				fmt.Println("   ✓ registries.yaml unchanged, skipping restart")
+			}
+		}
+		if needsRestart {
+			if _, err := executor.Exec("sudo systemctl restart k3s-agent"); err != nil {
+				return fmt.Errorf("failed to restart k3s-agent: %w", err)
+			}
+			if err := waitForK3sAgentReady(executor, DefaultRetryConfig()); err != nil {
+				return err
 			}
 		}
 
@@ -70,6 +76,9 @@ func JoinWorker(ctx context.Context, executor SSHExecutor, serverURL string, tok
 	}
 
 	// Step 1: Configure DNS (if DNS servers provided)
+	if _, err := updateNetworkConfig(executor, cfg, false); err != nil {
+		return fmt.Errorf("failed to create k3s network config: %w", err)
+	}
 	if len(cfg.DNSServers) > 0 {
 		if err := configureDNS(executor, cfg.DNSServers); err != nil {
 			return fmt.Errorf("failed to configure DNS: %w", err)

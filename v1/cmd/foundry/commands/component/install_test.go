@@ -439,6 +439,7 @@ type fakeK3sExecutor struct {
 	commands []string
 	// existingRegistries is returned for `cat .../registries.yaml`.
 	existingRegistries string
+	existingNetwork    string
 	// k3sActive controls whether k3s reports as installed.
 	k3sActive bool
 	// execErr, when set, is returned for any command matching failOn.
@@ -464,6 +465,10 @@ func (f *fakeK3sExecutor) Exec(command string) (*ssh.ExecResult, error) {
 		return &ssh.ExecResult{ExitCode: 0, Stdout: "active"}, nil
 	case strings.Contains(command, "cat /etc/rancher/k3s/registries.yaml"):
 		return &ssh.ExecResult{ExitCode: 0, Stdout: f.existingRegistries}, nil
+	case strings.Contains(command, k3s.NetworkConfigPath):
+		return &ssh.ExecResult{ExitCode: 0, Stdout: f.existingNetwork}, nil
+	case strings.Contains(command, "ip -o -4 addr show"):
+		return &ssh.ExecResult{ExitCode: 0, Stdout: "eth0\n"}, nil
 	case strings.Contains(command, "k3s kubectl get nodes"):
 		return &ssh.ExecResult{ExitCode: 0, Stdout: "node Ready"}, nil
 	}
@@ -636,22 +641,25 @@ func TestInstallK3sComponent_SkipsRestartWhenConfigUnchanged(t *testing.T) {
 
 	// Second pass: node already has that exact config.
 	second := newK3sTestHarness()
-	second.template = func(e *fakeK3sExecutor) { e.existingRegistries = desired.RegistryConfig }
+	second.template = func(e *fakeK3sExecutor) {
+		e.existingRegistries = desired.RegistryConfig
+		e.existingNetwork = k3s.GenerateNetworkConfigYAML(&k3s.Config{NodeIP: "192.168.1.10", FlannelIface: "eth0", AdvertiseAddress: "192.168.1.10"}, true)
+	}
 	require.NoError(t, installK3sComponent(context.Background(), cfg, second.connector(), false, false))
 
 	assert.False(t, second.executors["cp1"].restartedK3s(),
 		"k3s must not restart when registries.yaml is unchanged")
 }
 
-// Config.Interface names a NIC (eth0) and is detected on the node; it must
-// never be populated from host.Address. Regression guard.
-func TestBuildK3sNodeConfig_LeavesInterfaceUnset(t *testing.T) {
+func TestBuildK3sNodeConfigSeparatesVIPAndNodeIP(t *testing.T) {
 	cfg := k3sTestConfig()
 
-	k3sConfig := buildK3sNodeConfig(cfg)
+	k3sConfig := buildK3sNodeConfig(cfg, cfg.Hosts[0])
 
 	assert.Empty(t, k3sConfig.Interface,
-		"Interface is a NIC name detected on the node, not an address from config")
+		"legacy kube-vip Interface must not be populated from an address")
+	assert.Equal(t, "192.168.1.10", k3sConfig.NodeIP)
+	assert.Equal(t, "192.168.1.10", k3sConfig.AdvertiseAddress)
 	assert.Equal(t, "192.168.1.100", k3sConfig.VIP)
 	assert.NotEmpty(t, k3sConfig.RegistryConfig,
 		"a reachable Zot host should populate registries.yaml")

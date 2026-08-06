@@ -72,6 +72,11 @@ func UpdateK3sConfig(ctx context.Context, executor SSHExecutor, cfg *Config) err
 
 	// Track if we need to restart K3s
 	needsRestart := false
+	changed, err := updateNetworkConfig(executor, cfg, true)
+	if err != nil {
+		return fmt.Errorf("failed to update k3s network config: %w", err)
+	}
+	needsRestart = needsRestart || changed
 
 	// Update etcd config if configured (for virtualized environments)
 	if len(cfg.EtcdArgs) > 0 {
@@ -153,6 +158,11 @@ func InstallControlPlane(ctx context.Context, executor SSHExecutor, cfg *Config)
 
 		// Track if we need to restart K3s
 		needsRestart := false
+		changed, err := updateNetworkConfig(executor, cfg, true)
+		if err != nil {
+			return fmt.Errorf("failed to update k3s network config: %w", err)
+		}
+		needsRestart = needsRestart || changed
 
 		// Update etcd config if configured (for virtualized environments)
 		if len(cfg.EtcdArgs) > 0 {
@@ -235,6 +245,9 @@ func InstallControlPlane(ctx context.Context, executor SSHExecutor, cfg *Config)
 	}
 
 	// Step 1: Configure DNS (if DNS servers provided)
+	if _, err := updateNetworkConfig(executor, cfg, true); err != nil {
+		return fmt.Errorf("failed to create k3s network config: %w", err)
+	}
 	if len(cfg.DNSServers) > 0 {
 		if err := configureDNS(executor, cfg.DNSServers); err != nil {
 			return fmt.Errorf("failed to configure DNS: %w", err)
@@ -275,6 +288,32 @@ func InstallControlPlane(ctx context.Context, executor SSHExecutor, cfg *Config)
 	}
 
 	return nil
+}
+
+func updateNetworkConfig(executor SSHExecutor, cfg *Config, server bool) (bool, error) {
+	if cfg.NodeIP == "" && cfg.FlannelIface == "" && cfg.AdvertiseAddress == "" {
+		return false, nil
+	}
+	content := GenerateNetworkConfigYAML(cfg, server)
+	existing, _ := executor.Exec("sudo cat " + NetworkConfigPath + " 2>/dev/null")
+	if existing != nil && strings.TrimSpace(existing.Stdout) == strings.TrimSpace(content) {
+		return false, nil
+	}
+	if result, err := executor.Exec("sudo mkdir -p /etc/rancher/k3s/config.yaml.d"); err != nil || result.ExitCode != 0 {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("mkdir exited with code %d", result.ExitCode)
+	}
+	escaped := strings.ReplaceAll(content, "'", "'\"'\"'")
+	result, err := executor.Exec(fmt.Sprintf("echo '%s' | sudo tee %s >/dev/null", escaped, NetworkConfigPath))
+	if err != nil {
+		return false, err
+	}
+	if result.ExitCode != 0 {
+		return false, fmt.Errorf("write exited with code %d", result.ExitCode)
+	}
+	return true, nil
 }
 
 // configureDNS configures DNS on the node

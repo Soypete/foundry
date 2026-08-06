@@ -3,6 +3,7 @@ package k3s
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
 )
@@ -72,6 +73,15 @@ func ParseConfig(cfg component.ComponentConfig) (*Config, error) {
 	// Interface
 	if iface, ok := cfg.GetString("interface"); ok {
 		config.Interface = iface
+	}
+	if value, ok := cfg.GetString("node_ip"); ok {
+		config.NodeIP = value
+	}
+	if value, ok := cfg.GetString("flannel_iface"); ok {
+		config.FlannelIface = value
+	}
+	if value, ok := cfg.GetString("advertise_address"); ok {
+		config.AdvertiseAddress = value
 	}
 
 	// Cluster token
@@ -203,6 +213,15 @@ func (c *Config) Validate() error {
 	allowCGNAT := c.AllowCGNATVIP != nil && *c.AllowCGNATVIP
 	if err := ValidateVIP(c.VIP, allowCGNAT); err != nil {
 		return fmt.Errorf("VIP validation failed: %w", err)
+	}
+	if c.NodeIP != "" && net.ParseIP(c.NodeIP) == nil {
+		return fmt.Errorf("node_ip must be an IP address")
+	}
+	if c.NodeIP != "" && c.NodeIP == c.VIP {
+		return fmt.Errorf("node_ip must differ from the API VIP")
+	}
+	if c.AdvertiseAddress != "" && net.ParseIP(c.AdvertiseAddress) == nil {
+		return fmt.Errorf("advertise_address must be an IP address")
 	}
 
 	// If joining an existing cluster, server URL is required

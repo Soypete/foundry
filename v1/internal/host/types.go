@@ -47,14 +47,17 @@ func ValidStates() []string {
 
 // Host represents a managed host in the infrastructure
 type Host struct {
-	Hostname  string            // Friendly name for the host
-	Address   string            // IP address or FQDN
-	Port      int               // SSH port (default 22)
-	User      string            // SSH user
-	SSHKeySet bool              // Whether an SSH key has been configured for this host
-	Roles     []string          // Component roles (openbao, dns, zot, cluster-control-plane, cluster-worker)
-	State     string            // Host state (added, ssh-configured, configured)
-	Labels    map[string]string // Kubernetes node labels (optional)
+	Hostname         string            // Friendly name for the host
+	Address          string            // IP address or FQDN
+	NodeIP           string            `json:"node_ip,omitempty" yaml:"node_ip,omitempty"`                     // Physical cluster/LAN address; defaults to Address when Address is an IP
+	FlannelInterface string            `json:"flannel_interface,omitempty" yaml:"flannel_interface,omitempty"` // Physical interface used for the Flannel underlay
+	TailscaleAddress string            `json:"tailscale_address,omitempty" yaml:"tailscale_address,omitempty"` // Optional remote-management/API address; never used by Flannel
+	Port             int               // SSH port (default 22)
+	User             string            // SSH user
+	SSHKeySet        bool              // Whether an SSH key has been configured for this host
+	Roles            []string          // Component roles (openbao, dns, zot, cluster-control-plane, cluster-worker)
+	State            string            // Host state (added, ssh-configured, configured)
+	Labels           map[string]string // Kubernetes node labels (optional)
 }
 
 // HostRegistry defines the interface for managing hosts
@@ -96,6 +99,15 @@ func (h *Host) Validate() error {
 	// Validate address is either a valid IP or hostname
 	if !isValidAddress(h.Address) {
 		return fmt.Errorf("invalid address format: %s", h.Address)
+	}
+	if h.NodeIP != "" && net.ParseIP(h.NodeIP) == nil {
+		return fmt.Errorf("node_ip must be an IP address: %s", h.NodeIP)
+	}
+	if h.TailscaleAddress != "" && net.ParseIP(h.TailscaleAddress) == nil {
+		return fmt.Errorf("tailscale_address must be an IP address: %s", h.TailscaleAddress)
+	}
+	if h.FlannelInterface != "" && !regexp.MustCompile(`^[a-zA-Z0-9_.:-]+$`).MatchString(h.FlannelInterface) {
+		return fmt.Errorf("invalid flannel_interface: %s", h.FlannelInterface)
 	}
 
 	if h.Port <= 0 || h.Port > 65535 {

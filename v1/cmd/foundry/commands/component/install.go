@@ -828,10 +828,16 @@ func reconcileK3sNodeWithConnector(ctx context.Context, stackConfig *config.Conf
 // buildK3sNodeConfig assembles the k3s.Config applied to a node.
 // Interface is deliberately left unset: it names a NIC (e.g. eth0), not an
 // address, and is detected on the node itself when kube-vip needs it.
-func buildK3sNodeConfig(stackConfig *config.Config) *k3s.Config {
+func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) *k3s.Config {
 	k3sConfig := &k3s.Config{
 		VIP: stackConfig.Cluster.VIP,
 	}
+	k3sConfig.NodeIP = h.NodeIP
+	if k3sConfig.NodeIP == "" {
+		k3sConfig.NodeIP = h.Address
+	}
+	k3sConfig.FlannelIface = h.FlannelInterface
+	k3sConfig.AdvertiseAddress = k3sConfig.NodeIP
 
 	// Parse additional registries from component config
 	if k3sCompCfg, exists := stackConfig.Components["k3s"]; exists {
@@ -854,7 +860,7 @@ func buildK3sNodeConfig(stackConfig *config.Config) *k3s.Config {
 // reconcileK3sNode reconciles a single k3s node's configuration.
 // executor must be connected to h; it may be nil when dryRun is true.
 func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.Host, executor k3s.SSHExecutor, dryRun bool) error {
-	k3sConfig := buildK3sNodeConfig(stackConfig)
+	k3sConfig := buildK3sNodeConfig(stackConfig, h)
 
 	if dryRun {
 		fmt.Println("  [dry-run] Would apply k3s configuration:")
@@ -874,6 +880,9 @@ func reconcileK3sNode(ctx context.Context, stackConfig *config.Config, h *host.H
 
 	if !isInstalled {
 		return fmt.Errorf("k3s is not installed on node %s - use 'foundry stack install' to install k3s", h.Hostname)
+	}
+	if err := k3s.ResolveNodeNetwork(executor, k3sConfig); err != nil {
+		return fmt.Errorf("failed to resolve node network: %w", err)
 	}
 
 	// Use the idempotent update path

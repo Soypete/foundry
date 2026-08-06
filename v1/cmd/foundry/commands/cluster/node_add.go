@@ -256,6 +256,16 @@ func addNodeToCluster(ctx context.Context, hostname string, nodeRole *k3s.Determ
 	defer conn.Close()
 
 	// Step 4: Build K3s config
+	var targetHost *host.Host
+	for _, candidate := range cfg.Hosts {
+		if candidate.Hostname == hostname {
+			targetHost = candidate
+			break
+		}
+	}
+	if targetHost == nil {
+		return fmt.Errorf("host %s is not present in configuration", hostname)
+	}
 	serverURL := fmt.Sprintf("https://%s:6443", cfg.Cluster.VIP)
 	k3sConfig := &k3s.Config{
 		ClusterInit:  false,
@@ -268,6 +278,10 @@ func addNodeToCluster(ctx context.Context, hostname string, nodeRole *k3s.Determ
 			fmt.Sprintf("%s.%s", cfg.Cluster.Name, cfg.Cluster.PrimaryDomain),
 		},
 		DisableComponents: []string{"traefik", "servicelb"},
+	}
+	applyHostNetwork(targetHost, k3sConfig)
+	if err := k3s.ResolveNodeNetwork(conn, k3sConfig); err != nil {
+		return fmt.Errorf("failed to resolve node network: %w", err)
 	}
 
 	// Parse additional registries from component config

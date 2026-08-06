@@ -151,6 +151,9 @@ func (c *Config) validateK8sVIPUniqueness() error {
 
 	// Check against all host addresses
 	for _, h := range c.Hosts {
+		if h.NodeIP == vip {
+			return fmt.Errorf("k8s_vip %q conflicts with host %q node_ip - VIP must remain separate from the physical node address", vip, h.Hostname)
+		}
 		if h.Address == vip {
 			// Special error message for control plane conflicts (common mistake)
 			if h.HasRole(host.RoleClusterControlPlane) {

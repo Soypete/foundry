@@ -84,6 +84,7 @@ foundry/
 - [Secrets](./docs/secrets.md) - Secret management with instance scoping
 - [Hosts](./docs/hosts.md) - Infrastructure host management
 - [Gateway Controller](./docs/gateway-controller.md) - Route-driven L4 (TCP/TLS) listeners on the cluster VIP
+- [K3s network planes](./docs/network-planes.md) - LAN, Flannel, Service, API VIP, and Tailscale address roles
 
 ## Quick Start
 
