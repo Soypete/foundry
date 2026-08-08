@@ -27,6 +27,8 @@ Velero backs up:
 - Persistent Volume data (via Longhorn snapshots or restic)
 - Custom Resource Definitions and instances
 
+> **⚠️ Important**: Backups stored inside the cluster they protect are NOT true backups. If the cluster fails (etcd loss, total hardware failure), you lose access to the backup metadata. For production, store backups in external S3-compatible storage outside the cluster.
+
 ## Configuration
 
 ```yaml
@@ -197,6 +199,124 @@ velero:
   snapshots_enabled: true
   csi_snapshot_timeout: 10m
 ```
+
+## Reinstalling the Cluster
+
+### CRITICAL: Do NOT Reinstall VM-based Components
+
+When recovering from a power outage or cluster failure, **do NOT reinstall** the following components that live on VMs:
+
+| Component | Host | Why Not Reinstall |
+|-----------|------|-------------------|
+| openbao | refurb | Contains all secrets, tokens, kubeconfig |
+| PowerDNS (dns) | blue1 | Contains zone data |
+| zot | refurb | OCI registry with images |
+
+Reinstalling these will **delete your data**:
+- Reinstalling OpenBAO = loss of all secrets, tokens, credentials
+- Reinstalling PowerDNS = loss of DNS zones
+- Reinstalling zot = loss of container images
+
+### CRITICAL: Longhorn Holds All k8s Data
+
+Longhorn is the foundation for all Kubernetes storage. **Do NOT reinstall Longhorn** if you want to preserve:
+
+- SeaweedFS data (including Velero backups in the `velero` bucket)
+- Prometheus/Grafana/Loki metrics data
+- Any PVC-based application data
+
+**The dependency chain:**
+```
+Velero backups → SeaweedFS S3 → Longhorn PVCs → Longhorn
+```
+
+If Longhorn is reinstalled, all PVCs are wiped, and you lose:
+- SeaweedFS data
+- Velero backup files
+- All persistent application data
+
+### CRITICAL: etcd Loss Orphans All Data
+
+**Reinstalling k3s wipes etcd**, which destroys all Kubernetes Custom Resource Definitions and instances, including:
+- Longhorn volume CRs (even if Longhorn itself is not reinstalled)
+- Velero backup CRs
+- All Deployments, Services, ConfigMaps, etc.
+
+This means **backups stored inside the cluster they protect aren't backups** — if you lose the cluster, you lose access to the backup metadata. Off-cluster backup storage (external S3, cold storage) is required for true disaster recovery.
+
+### What Can Be Reinstalled (k8s-based, but be careful)
+
+These components are **safe to reinstall** if Longhorn is preserved:
+- k3s (cluster) - preserves Longhorn data
+- contour (ingress)
+- prometheus, grafana, loki (monitoring) - may lose historical data
+- external-dns
+
+**Use with caution**:
+- seaweedfs - if Longhorn PVCs exist, it will reuse them
+- longhorn - **never reinstall** if you want to keep data
+- velero - safe to reinstall if SeaweedFS bucket exists
+
+### Safe Recovery Procedure
+
+1. **Check VM services first**:
+   ```bash
+   ssh refurb "sudo systemctl status openbao"
+   ssh blue1 "sudo systemctl status powerdns"
+   ```
+
+2. **If VMs are OK, skip their installation** in stack.yaml:
+   ```yaml
+   setup_state:
+     openbao_installed: true
+     openbao_initialized: true
+     dns_installed: true
+     dns_zones_created: true
+     zot_installed: true
+     k8s_installed: false  # Can reinstall k3s
+   ```
+
+3. **Install only k8s components**:
+   ```bash
+   ./bin/foundry stack install --config ~/.foundry/stack.yaml
+   ```
+
+4. **Restore Velero backups** (after cluster is healthy):
+   ```bash
+   velero backup get
+   velero restore create --from-backup <backup-name>
+   ```
+
+### If Backups Are Lost
+
+If SeaweedFS was reinstalled and the `velero` bucket no longer exists:
+- Check if volume data still exists on the underlying storage
+- Longhorn snapshots may still exist if Longhorn itself wasn't fully wiped
+- Contact support if physical storage is accessible
+
+---
+
+When reinstalling the cluster (e.g., after a failure or hardware reset), the backup data in SeaweedFS persists independently:
+
+1. **Backup data is safe**: Backups are stored in the SeaweedFS S3 bucket (`velero`), which runs outside the k3s cluster on VMs or bare metal
+2. **Reinstall Velero**: Once the new cluster is running, reinstall Velero with the same S3 configuration
+3. **Remount the bucket**: Velero will automatically discover existing backups in the SeaweedFS bucket
+
+### Restoring After Reinstall
+
+```bash
+# After Velero is reinstalled with same S3 config
+# List existing backups (they're read from SeaweedFS directly)
+velero backup get
+
+# Restore from any existing backup
+velero restore create --from-backup <backup-name>
+```
+
+The backup files remain in SeaweedFS at:
+- `http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333/velero/`
+
+**Note**: If Longhorn was not installed on the original cluster, PVC-based data was not backed up. Only Kubernetes resources (Deployments, Services, ConfigMaps, etc.) stored in Velero can be restored.
 
 ## Troubleshooting
 
