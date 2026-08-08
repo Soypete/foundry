@@ -291,7 +291,7 @@ func TestValidateNetworkConfig(t *testing.T) {
 				},
 			},
 			wantErr: true,
-			errMsg:  "not in network",
+			errMsg:  "outside network",
 		},
 		{
 			name: "DHCP conflict",
@@ -703,9 +703,10 @@ func TestRunStackValidate_Integration(t *testing.T) {
 			},
 		}
 
-		// Should fail on network validation (VIP not on same network)
+		// Network validation passes: an off-LAN VIP is legitimate (kube-vip
+		// carries it as a /32) and the host's address is on the LAN.
 		err := validateNetworkConfig(invalidCfg)
-		assert.Error(t, err)
+		assert.NoError(t, err)
 
 		// Should fail on DNS validation (no infrastructure zones)
 		err = validateDNSConfig(invalidCfg)
