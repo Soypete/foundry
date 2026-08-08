@@ -10,5 +10,6 @@ var Command = &cli.Command{
 		ListCommand,
 		InstallCommand,
 		StatusCommand,
+		TailscaleCommand,
 	},
 }

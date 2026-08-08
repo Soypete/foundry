@@ -29,6 +29,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/prometheus"
 	"github.com/catalystcommunity/foundry/v1/internal/component/seaweedfs"
 	"github.com/catalystcommunity/foundry/v1/internal/component/storage"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/component/velero"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/container"
@@ -2672,111 +2673,9 @@ func isSecretRef(s string) bool {
 	return len(s) > 10 && s[:9] == "${secret:" && s[len(s)-1] == '}'
 }
 
-const tailscaleDocsURL = "https://tailscale.com/docs/kubernetes-operator/quickstart#create-oauth-credentials-and-configure-secrets"
-
-// getTailscaleOAuthCredentials retrieves or stores Tailscale OAuth credentials in OpenBAO
-// If Tailscale is enabled but credentials are missing, returns an error with instructions
-func getTailscaleOAuthCredentials(cfg *config.Config, configDir string) (clientID, clientSecret string, err error) {
-	// Check if Tailscale is enabled in config
-	tailscaleEnabled := false
-	if cfg.Components != nil {
-		if tsCfg, exists := cfg.Components["tailscale"]; exists {
-			if enabled, ok := tsCfg.Config["enabled"].(bool); ok {
-				tailscaleEnabled = enabled
-			} else {
-				// If config exists but no enabled field, assume enabled
-				tailscaleEnabled = true
-			}
-		}
-	}
-
-	// If not enabled, return empty (no credentials needed)
-	if !tailscaleEnabled {
-		return "", "", nil
-	}
-
-	// Get OpenBAO address from config
-	openBAOAddr, err := cfg.GetPrimaryOpenBAOURL()
-	if err != nil {
-		return "", "", fmt.Errorf("OpenBAO host not configured: %w", err)
-	}
-
-	// Get OpenBAO token from keys file
-	keysPath := filepath.Join(configDir, "openbao-keys", cfg.Cluster.Name, "keys.json")
-	keysData, err := os.ReadFile(keysPath)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to read OpenBAO keys: %w", err)
-	}
-
-	var keys struct {
-		RootToken string `json:"root_token"`
-	}
-	if err := json.Unmarshal(keysData, &keys); err != nil {
-		return "", "", fmt.Errorf("failed to parse OpenBAO keys: %w", err)
-	}
-
-	openBAOClient := openbao.NewClient(openBAOAddr, keys.RootToken)
-	ctx := context.Background()
-
-	// First, check if credentials are in the component config
-	if cfg.Components != nil {
-		if tsCfg, exists := cfg.Components["tailscale"]; exists {
-			cfgClientID, hasClientID := tsCfg.Config["oauth_client_id"].(string)
-			cfgClientSecret, hasClientSecret := tsCfg.Config["oauth_client_secret"].(string)
-
-			if hasClientID && hasClientSecret && cfgClientID != "" && cfgClientSecret != "" {
-				// Check if these are secret references
-				if isSecretRef(cfgClientSecret) {
-					// Read from OpenBao - tailscale secrets are stored at foundry-core/tailscale
-					secretData, err := openBAOClient.ReadSecretV2(ctx, "foundry-core", "tailscale")
-					if err != nil {
-						return "", "", fmt.Errorf("failed to read Tailscale credentials from OpenBao: %w", err)
-					}
-					if secretData == nil {
-						return "", "", fmt.Errorf("Tailscale OAuth credentials not found in OpenBao. To create credentials, visit: %s", tailscaleDocsURL)
-					}
-					if cID, ok := secretData["client_id"].(string); ok {
-						clientID = cID
-					}
-					if cSec, ok := secretData["client_secret"].(string); ok {
-						clientSecret = cSec
-					}
-				} else {
-					// Plain text credentials - store in OpenBao
-					fmt.Println("  Storing Tailscale OAuth credentials in OpenBAO...")
-					secretData := map[string]interface{}{
-						"client_id":     cfgClientID,
-						"client_secret": cfgClientSecret,
-					}
-					if err := openBAOClient.WriteSecretV2(ctx, "foundry-core", "tailscale", secretData); err != nil {
-						return "", "", fmt.Errorf("failed to store Tailscale credentials in OpenBAO: %w", err)
-					}
-					fmt.Println("  ✓ Tailscale OAuth credentials stored in OpenBAO")
-					clientID = cfgClientID
-					clientSecret = cfgClientSecret
-				}
-				return clientID, clientSecret, nil
-			}
-		}
-	}
-
-	// If not in config, try to read existing credentials from OpenBao
-	existingData, err := openBAOClient.ReadSecretV2(ctx, "foundry-core", "tailscale")
-	if err == nil && existingData != nil {
-		if cID, ok := existingData["client_id"].(string); ok {
-			clientID = cID
-		}
-		if cSec, ok := existingData["client_secret"].(string); ok {
-			clientSecret = cSec
-		}
-		if clientID != "" && clientSecret != "" {
-			return clientID, clientSecret, nil
-		}
-	}
-
-	// Credentials not found - return error with instructions
-	return "", "", fmt.Errorf("Tailscale is enabled but OAuth credentials are missing. To create OAuth credentials, visit: %s", tailscaleDocsURL)
-}
+// tailscaleDocsURL is the Tailscale OAuth setup documentation. Sourced from the
+// tailscale component so validation and installation cite the same page.
+const tailscaleDocsURL = tailscale.DocsURL
 
 // findTemplatePlaceholders scans the config for any <PLACEHOLDER> values
 func findTemplatePlaceholders(cfg *config.Config) []string {

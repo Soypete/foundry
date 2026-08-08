@@ -15,30 +15,36 @@ type KubernetesClient interface {
 type CRDInstaller struct {
 	client KubernetesClient
 	config *Config
-	vip    string
 }
 
 // NewCRDInstaller creates a new CRD installer for Tailscale.
-func NewCRDInstaller(client KubernetesClient, config *Config, vip string) (*CRDInstaller, error) {
+func NewCRDInstaller(client KubernetesClient, config *Config) (*CRDInstaller, error) {
 	if client == nil {
 		return nil, fmt.Errorf("kubernetes client cannot be nil")
 	}
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
-	if vip == "" {
-		return nil, fmt.Errorf("VIP cannot be empty")
-	}
 
 	return &CRDInstaller{
 		client: client,
 		config: config,
-		vip:    vip,
 	}, nil
 }
 
-// DeployConnector deploys the Tailscale Connector CRD for subnet route advertisement.
+// DeployConnector deploys a Tailscale Connector advertising the subnet routes
+// from the component config.
+//
+// No-op when no routes are configured: a Connector exists to advertise routes,
+// and the cluster's own networks must not be among them. Pod, Service, and API
+// VIP addresses stay internal to the cluster — external access is provided by
+// per-service proxies and the API server proxy, not by putting cluster
+// networks on the tailnet.
 func (c *CRDInstaller) DeployConnector(ctx context.Context) error {
+	if len(c.config.AdvertiseRoutes) == 0 {
+		return nil
+	}
+
 	connector, err := c.generateConnectorManifest()
 	if err != nil {
 		return fmt.Errorf("failed to generate Connector manifest: %w", err)
@@ -66,24 +72,27 @@ func (c *CRDInstaller) DeployDNSConfig(ctx context.Context) error {
 }
 
 // generateConnectorManifest creates the Connector CRD manifest.
+//
+// Only the routes explicitly configured in advertise_routes are advertised.
+// The API VIP is deliberately never included: it is internal to the cluster
+// data plane, and advertising it as a subnet route is what previously placed
+// cluster traffic on the tailnet.
 func (c *CRDInstaller) generateConnectorManifest() (map[string]interface{}, error) {
-	// Build advertised routes: VIP + any additional routes from config
-	routes := []string{fmt.Sprintf("%s/32", c.vip)}
-	if c.config.AdvertiseRoutes != nil {
-		routes = append(routes, c.config.AdvertiseRoutes...)
+	if len(c.config.AdvertiseRoutes) == 0 {
+		return nil, fmt.Errorf("no advertise_routes configured")
 	}
+	routes := append([]string(nil), c.config.AdvertiseRoutes...)
 
-	// Build tags: default tag + any additional tags from config
-	tags := []string{"tag:k8s-foundry"}
-	if c.config.Tags != nil {
-		tags = append(tags, c.config.Tags...)
+	tags := c.config.Tags
+	if len(tags) == 0 {
+		tags = []string{DefaultTag}
 	}
 
 	connector := map[string]interface{}{
 		"apiVersion": "tailscale.com/v1alpha1",
 		"kind":       "Connector",
 		"metadata": map[string]interface{}{
-			"name":      "foundry-vip-connector",
+			"name":      "foundry-subnet-router",
 			"namespace": DefaultNamespace,
 		},
 		"spec": map[string]interface{}{
