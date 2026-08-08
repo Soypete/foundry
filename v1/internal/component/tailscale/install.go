@@ -133,6 +133,9 @@ type Health struct {
 	// OperatorAddress is the operator's tailnet address, empty when unknown.
 	OperatorAddress string
 
+	// AddressState explains an empty OperatorAddress.
+	AddressState AddressState
+
 	// Ingresses are the Tailscale-backed ingress endpoints and their state.
 	Ingresses []Ingress
 }
@@ -169,10 +172,22 @@ func (h Health) Summary() string {
 			ready++
 		}
 	}
-	addr := h.OperatorAddress
-	if addr == "" {
-		addr = "unknown"
-	}
 	return fmt.Sprintf("operator %s at %s; %d/%d ingress ready",
-		h.ReleaseStatus, addr, ready, len(h.Ingresses))
+		h.ReleaseStatus, h.AddressDescription(), ready, len(h.Ingresses))
+}
+
+// AddressDescription renders the operator's tailnet address, or why there is
+// none. The two empty cases mean different things, so they read differently.
+func (h Health) AddressDescription() string {
+	if h.OperatorAddress != "" {
+		return h.OperatorAddress
+	}
+	switch h.AddressState {
+	case AddressServiceMissing:
+		return "no operator service found"
+	case AddressNotAssigned:
+		return "not yet registered on the tailnet"
+	default:
+		return "unknown"
+	}
 }

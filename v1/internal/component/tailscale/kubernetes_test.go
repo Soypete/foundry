@@ -190,6 +190,116 @@ func TestOperatorAddress(t *testing.T) {
 	})
 }
 
+// TestOperatorAddressState covers the distinction the bare address hides: a
+// missing Service and a Service without an address are different faults.
+func TestOperatorAddressState(t *testing.T) {
+	t.Run("found", func(t *testing.T) {
+		adapter := newTestAdapter(t, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: operatorServiceName, Namespace: DefaultNamespace},
+			Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{Hostname: "operator.tail-scale.ts.net"}},
+			}},
+		})
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "operator.tail-scale.ts.net", addr)
+		assert.Equal(t, AddressFound, state)
+	})
+
+	// The operator is deployed but has not joined the tailnet -- normal while
+	// starting, a fault if it persists.
+	t.Run("service exists with no address", func(t *testing.T) {
+		adapter := newTestAdapter(t, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: operatorServiceName, Namespace: DefaultNamespace},
+		})
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Empty(t, addr)
+		assert.Equal(t, AddressNotAssigned, state)
+	})
+
+	t.Run("no service at all", func(t *testing.T) {
+		adapter := newTestAdapter(t)
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Empty(t, addr)
+		assert.Equal(t, AddressServiceMissing, state)
+	})
+
+	t.Run("falls back to externalName", func(t *testing.T) {
+		adapter := newTestAdapter(t, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: operatorServiceName, Namespace: DefaultNamespace},
+			Spec:       corev1.ServiceSpec{ExternalName: "operator.tail-scale.ts.net"},
+		})
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "operator.tail-scale.ts.net", addr)
+		assert.Equal(t, AddressFound, state)
+	})
+}
+
+// TestFindOperatorServiceByLabel covers an operator installed outside Foundry,
+// whose Service is not at the conventional name. Assuming the name is what made
+// the original lookup fragile.
+func TestFindOperatorServiceByLabel(t *testing.T) {
+	labelled := func(name string, labels map[string]string) *corev1.Service {
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: DefaultNamespace, Labels: labels},
+			Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{Hostname: "found.tail-scale.ts.net"}},
+			}},
+		}
+	}
+
+	for _, tt := range []struct {
+		name   string
+		labels map[string]string
+	}{
+		{"chart name label", map[string]string{"app.kubernetes.io/name": "tailscale-operator"}},
+		{"short name label", map[string]string{"app.kubernetes.io/name": "tailscale"}},
+		{"legacy app label", map[string]string{"app": "tailscale-operator"}},
+		{"bare operator label", map[string]string{"app": "operator"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := newTestAdapter(t, labelled("ts-operator-custom", tt.labels))
+
+			addr, state, err := adapter.OperatorAddressState(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, "found.tail-scale.ts.net", addr)
+			assert.Equal(t, AddressFound, state)
+		})
+	}
+
+	t.Run("unrelated services are ignored", func(t *testing.T) {
+		adapter := newTestAdapter(t, labelled("grafana", map[string]string{"app": "grafana"}))
+
+		_, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, AddressServiceMissing, state)
+	})
+
+	// The conventional name wins so a labelled decoy cannot shadow it.
+	t.Run("prefers the conventional name", func(t *testing.T) {
+		adapter := newTestAdapter(t,
+			&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: operatorServiceName, Namespace: DefaultNamespace},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{
+					Ingress: []corev1.LoadBalancerIngress{{Hostname: "canonical.ts.net"}},
+				}},
+			},
+			labelled("other", map[string]string{"app.kubernetes.io/name": "tailscale-operator"}),
+		)
+
+		addr, _, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "canonical.ts.net", addr)
+	})
+}
+
 func TestListTailscaleIngresses(t *testing.T) {
 	ingress := func(namespace, name, class string, lb []networkingv1.IngressLoadBalancerIngress) *networkingv1.Ingress {
 		ing := &networkingv1.Ingress{

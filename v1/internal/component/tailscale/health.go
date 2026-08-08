@@ -16,9 +16,9 @@ type IngressLister interface {
 	// "tailscale", with the hostname the operator assigned.
 	ListTailscaleIngresses(ctx context.Context) ([]Ingress, error)
 
-	// OperatorAddress returns the operator's tailnet address, or "" if the
-	// operator has not registered one yet.
-	OperatorAddress(ctx context.Context) (string, error)
+	// OperatorAddressState returns the operator's tailnet address, and when it
+	// is empty, why: no Service found versus a Service with no address.
+	OperatorAddressState(ctx context.Context) (string, AddressState, error)
 }
 
 // HealthChecker reports the observable state of the Tailscale integration.
@@ -56,11 +56,12 @@ func (h *HealthChecker) Check(ctx context.Context) (*Health, error) {
 
 	// A missing address is a reportable state, not a failure: the operator may
 	// still be registering with the tailnet.
-	addr, err := h.ingress.OperatorAddress(ctx)
+	addr, state, err := h.ingress.OperatorAddressState(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read operator address: %w", err)
 	}
 	health.OperatorAddress = addr
+	health.AddressState = state
 
 	ingresses, err := h.ingress.ListTailscaleIngresses(ctx)
 	if err != nil {

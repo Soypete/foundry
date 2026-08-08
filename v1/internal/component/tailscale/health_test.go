@@ -12,14 +12,22 @@ import (
 
 // fakeIngressLister returns synthetic tailnet state.
 type fakeIngressLister struct {
-	address    string
-	addressErr error
-	ingresses  []Ingress
-	listErr    error
+	address      string
+	addressState AddressState
+	addressErr   error
+	ingresses    []Ingress
+	listErr      error
 }
 
-func (f *fakeIngressLister) OperatorAddress(ctx context.Context) (string, error) {
-	return f.address, f.addressErr
+func (f *fakeIngressLister) OperatorAddressState(ctx context.Context) (string, AddressState, error) {
+	if f.addressErr != nil {
+		return "", AddressServiceMissing, f.addressErr
+	}
+	state := f.addressState
+	if f.address != "" {
+		state = AddressFound
+	}
+	return f.address, state, nil
 }
 
 func (f *fakeIngressLister) ListTailscaleIngresses(ctx context.Context) ([]Ingress, error) {
@@ -111,12 +119,13 @@ func TestHealthCheck(t *testing.T) {
 	// The operator may not have registered a tailnet address yet; that is a
 	// reportable state, not an error.
 	t.Run("missing operator address is reported not fatal", func(t *testing.T) {
-		checker := newHealthChecker(t, &mockHelmClient{releases: deployedRelease()}, &fakeIngressLister{})
+		checker := newHealthChecker(t, &mockHelmClient{releases: deployedRelease()},
+			&fakeIngressLister{addressState: AddressNotAssigned})
 
 		health, err := checker.Check(context.Background())
 		require.NoError(t, err)
 		assert.Empty(t, health.OperatorAddress)
-		assert.Contains(t, health.Summary(), "unknown")
+		assert.Contains(t, health.Summary(), "not yet registered on the tailnet")
 	})
 
 	t.Run("a non-deployed release is unhealthy", func(t *testing.T) {
@@ -262,4 +271,60 @@ func TestInstallOperatorRecoversFromNameInUse(t *testing.T) {
 	require.NoError(t, installer.InstallOperator(context.Background()))
 	assert.Len(t, helmClient.installCalls, 1)
 	assert.Len(t, helmClient.upgradeCalls, 1, "must fall back to upgrade")
+}
+
+// TestHealthAddressDescription covers how each empty-address cause is reported.
+// "no operator service found" and "not yet registered" call for different
+// action, so they must not read alike.
+func TestHealthAddressDescription(t *testing.T) {
+	tests := []struct {
+		name   string
+		health Health
+		want   string
+	}{
+		{
+			name:   "address present",
+			health: Health{OperatorAddress: "operator.ts.net", AddressState: AddressFound},
+			want:   "operator.ts.net",
+		},
+		{
+			name:   "no service found",
+			health: Health{AddressState: AddressServiceMissing},
+			want:   "no operator service found",
+		},
+		{
+			name:   "service exists but unregistered",
+			health: Health{AddressState: AddressNotAssigned},
+			want:   "not yet registered on the tailnet",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.health.AddressDescription())
+		})
+	}
+}
+
+// TestHealthCheckPropagatesAddressState confirms the state survives from the
+// lister through to Health, which is what the command prints.
+func TestHealthCheckPropagatesAddressState(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		state AddressState
+		want  string
+	}{
+		{"missing service", AddressServiceMissing, "no operator service found"},
+		{"unregistered", AddressNotAssigned, "not yet registered on the tailnet"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			checker := newHealthChecker(t, &mockHelmClient{releases: deployedRelease()},
+				&fakeIngressLister{addressState: tt.state})
+
+			health, err := checker.Check(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, tt.state, health.AddressState)
+			assert.Contains(t, health.Summary(), tt.want)
+		})
+	}
 }

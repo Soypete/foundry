@@ -118,10 +118,16 @@ func printTailscaleHealth(health *tailscale.Health) {
 	}
 
 	fmt.Printf("  Operator:  %s\n", health.ReleaseStatus)
-	if health.OperatorAddress != "" {
-		fmt.Printf("  Address:   %s\n", health.OperatorAddress)
-	} else {
-		fmt.Println("  Address:   not yet registered on the tailnet")
+	fmt.Printf("  Address:   %s\n", health.AddressDescription())
+
+	// An empty address has two very different causes; say what to do about each.
+	switch health.AddressState {
+	case tailscale.AddressServiceMissing:
+		fmt.Printf("             (looked for Service %q in namespace %q, and by operator labels)\n",
+			"operator", tailscale.DefaultNamespace)
+	case tailscale.AddressNotAssigned:
+		fmt.Println("             (the operator is running but has not joined the tailnet -")
+		fmt.Println("              check its logs and that its OAuth client is still valid)")
 	}
 
 	fmt.Println()

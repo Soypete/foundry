@@ -16,9 +16,21 @@ import (
 // tailscaleIngressClass is the ingressClassName the operator watches.
 const tailscaleIngressClass = "tailscale"
 
-// operatorServiceName is the Service the operator creates for itself; its
+// operatorServiceName is the Service the operator's own chart creates; its
 // tailnet address is published as the LoadBalancer ingress hostname.
+//
+// Not assumed to exist: an operator installed by hand may name it differently,
+// so lookup falls back to label discovery. See findOperatorService.
 const operatorServiceName = "operator"
+
+// operatorSelectors are label selectors used to find the operator's Service
+// when it is not at the conventional name, most to least specific.
+var operatorSelectors = []string{
+	"app.kubernetes.io/name=tailscale-operator",
+	"app.kubernetes.io/name=tailscale",
+	"app=tailscale-operator",
+	"app=operator",
+}
 
 // KubeAdapter implements the Kubernetes-facing interfaces this package needs
 // (SecretWriter, KubernetesClient, IngressLister) over the standard clients.
@@ -142,26 +154,92 @@ func gvrForManifest(obj *unstructured.Unstructured) (schema.GroupVersionResource
 }
 
 // OperatorAddress returns the operator's tailnet address, taken from its
-// Service's LoadBalancer ingress. Returns "" when the operator has not
-// registered one yet, which is a normal transient state.
+// Service's LoadBalancer ingress.
+//
+// Returns "" when no address is available. Use OperatorAddressState to tell
+// apart the reasons, which are operationally different.
 func (k *KubeAdapter) OperatorAddress(ctx context.Context) (string, error) {
-	svc, err := k.clientset.CoreV1().Services(DefaultNamespace).Get(ctx, operatorServiceName, metav1.GetOptions{})
+	addr, _, err := k.OperatorAddressState(ctx)
+	return addr, err
+}
+
+// AddressState describes why an operator address lookup produced what it did.
+type AddressState int
+
+const (
+	// AddressFound means a tailnet address was read from the Service.
+	AddressFound AddressState = iota
+
+	// AddressServiceMissing means no operator Service could be found. The
+	// operator is not deployed, or its Service is named and labelled
+	// unconventionally.
+	AddressServiceMissing
+
+	// AddressNotAssigned means the Service exists but carries no LoadBalancer
+	// address: the operator has not registered with the tailnet. Normal while
+	// starting up, a fault if it persists.
+	AddressNotAssigned
+)
+
+// OperatorAddressState returns the operator's tailnet address along with why it
+// is empty when it is.
+//
+// Collapsing "no Service" and "Service with no address" into a bare "" hides a
+// real distinction: the first says the operator is absent or misidentified, the
+// second says it is running but has not joined the tailnet. Only the second is
+// a normal transient state.
+func (k *KubeAdapter) OperatorAddressState(ctx context.Context) (string, AddressState, error) {
+	svc, err := k.findOperatorService(ctx)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
-		}
-		return "", fmt.Errorf("failed to read operator service: %w", err)
+		return "", AddressServiceMissing, err
+	}
+	if svc == nil {
+		return "", AddressServiceMissing, nil
 	}
 
 	for _, ing := range svc.Status.LoadBalancer.Ingress {
 		if ing.Hostname != "" {
-			return ing.Hostname, nil
+			return ing.Hostname, AddressFound, nil
 		}
 		if ing.IP != "" {
-			return ing.IP, nil
+			return ing.IP, AddressFound, nil
 		}
 	}
-	return "", nil
+
+	// The operator also publishes its address as an external name on some
+	// chart versions; fall back to it before reporting nothing.
+	if svc.Spec.ExternalName != "" {
+		return svc.Spec.ExternalName, AddressFound, nil
+	}
+
+	return "", AddressNotAssigned, nil
+}
+
+// findOperatorService locates the operator's Service, returning nil when there
+// is none. It tries the conventional name first, then label discovery, so an
+// operator installed outside Foundry is still found.
+func (k *KubeAdapter) findOperatorService(ctx context.Context) (*corev1.Service, error) {
+	services := k.clientset.CoreV1().Services(DefaultNamespace)
+
+	svc, err := services.Get(ctx, operatorServiceName, metav1.GetOptions{})
+	if err == nil {
+		return svc, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to read operator service: %w", err)
+	}
+
+	for _, selector := range operatorSelectors {
+		list, err := services.List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list services by %q: %w", selector, err)
+		}
+		if len(list.Items) > 0 {
+			return &list.Items[0], nil
+		}
+	}
+
+	return nil, nil
 }
 
 // ListTailscaleIngresses returns every Ingress served by the Tailscale ingress
