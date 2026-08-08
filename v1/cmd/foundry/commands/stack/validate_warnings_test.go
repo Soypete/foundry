@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/catalystcommunity/foundry/v1/cmd/foundry/registry"
+	"github.com/catalystcommunity/foundry/v1/internal/component"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/host"
 	"github.com/stretchr/testify/assert"
@@ -202,4 +204,25 @@ func TestWarningsAreAdvisoryNotFatal(t *testing.T) {
 	for _, w := range warnings {
 		assert.False(t, strings.HasPrefix(w, "✗"), "advisory text must not read as a failure")
 	}
+}
+
+// TestValidateComponentDependenciesAgainstRealRegistry guards the component
+// names in validateComponentDependencies against the real registry rather than
+// mocks.
+//
+// The hardcoded list previously said "certmanager" while the component
+// registers itself as "cert-manager", so `foundry stack validate` failed on
+// every config. The existing test missed it because it registered a mock under
+// the misspelled name -- it validated its own fixture, not reality.
+func TestValidateComponentDependenciesAgainstRealRegistry(t *testing.T) {
+	original := component.DefaultRegistry
+	t.Cleanup(func() { component.DefaultRegistry = original })
+
+	component.DefaultRegistry = component.NewRegistry()
+	require.NoError(t, registry.InitComponents(), "production registry must initialize")
+
+	err := validateComponentDependencies(&config.Config{
+		Components: config.ComponentMap{"openbao": {}},
+	})
+	assert.NoError(t, err, "every name in validateComponentDependencies must exist in the real registry")
 }

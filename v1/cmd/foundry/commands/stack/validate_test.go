@@ -22,7 +22,10 @@ func setupValidateTestRegistry(t *testing.T) {
 	component.DefaultRegistry.Register(&mockComponent{name: "zot", dependencies: []string{"dns", "openbao"}})
 	component.DefaultRegistry.Register(&mockComponent{name: "k3s", dependencies: []string{"openbao", "dns", "zot"}})
 	component.DefaultRegistry.Register(&mockComponent{name: "contour", dependencies: []string{"k3s"}})
-	component.DefaultRegistry.Register(&mockComponent{name: "certmanager", dependencies: []string{"k3s"}})
+	// Must match certmanager.Component.Name(); a mock under a different name
+	// would let validateComponentDependencies pass here while failing against
+	// the real registry.
+	component.DefaultRegistry.Register(&mockComponent{name: "cert-manager", dependencies: []string{"k3s"}})
 }
 
 // TestValidateConfigStructure tests basic config structure validation

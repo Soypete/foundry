@@ -186,14 +186,15 @@ func validateClusterConfig(cfg *config.Config) error {
 
 // validateComponentDependencies validates component dependencies can be resolved
 func validateComponentDependencies(cfg *config.Config) error {
-	// Get the installation order to verify dependencies can be resolved
+	// Names must match what each component reports from Name(), which is how
+	// the registry keys them — "cert-manager", not "certmanager".
 	componentNames := []string{
 		"openbao",
 		"dns",
 		"zot",
 		"k3s",
 		"contour",
-		"certmanager",
+		"cert-manager",
 	}
 
 	order, err := component.ResolveInstallationOrder(component.DefaultRegistry, componentNames)
@@ -201,10 +202,23 @@ func validateComponentDependencies(cfg *config.Config) error {
 		return fmt.Errorf("dependency resolution failed: %w", err)
 	}
 
-	// Verify we got all components in the order
-	if len(order) != len(componentNames) {
-		return fmt.Errorf("dependency resolution incomplete: expected %d components, got %d",
-			len(componentNames), len(order))
+	// Verify every requested component made it into the order. The result may
+	// legitimately be longer than the request — resolution pulls in transitive
+	// dependencies, e.g. contour brings in gateway-api — so compare membership
+	// rather than length.
+	resolved := make(map[string]bool, len(order))
+	for _, name := range order {
+		resolved[name] = true
+	}
+	var missing []string
+	for _, name := range componentNames {
+		if !resolved[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("dependency resolution incomplete: missing %s",
+			strings.Join(missing, ", "))
 	}
 
 	return nil
