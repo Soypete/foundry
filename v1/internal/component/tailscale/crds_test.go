@@ -3,13 +3,16 @@ package tailscale
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockKubernetesClient is a mock implementation of KubernetesClient for testing.
 type mockKubernetesClient struct {
-	applyErr        error
+	applyErr         error
 	manifestsApplied []map[string]interface{}
 }
 
@@ -21,473 +24,241 @@ func (m *mockKubernetesClient) Apply(ctx context.Context, manifest map[string]in
 	return nil
 }
 
+// Synthetic cluster-internal addresses that must never reach the tailnet.
+const (
+	testAPIVIP     = "10.0.0.11"
+	testPodCIDR    = "10.42.0.0/16"
+	testSvcCIDR    = "10.43.0.0/16"
+	testLANRoute   = "192.168.1.0/24"
+	testExtraRoute = "172.16.0.0/16"
+)
+
 func TestNewCRDInstaller(t *testing.T) {
 	tests := []struct {
 		name    string
 		client  KubernetesClient
 		config  *Config
-		vip     string
-		wantErr bool
-		errMsg  string
+		wantErr string
 	}{
+		{
+			name:   "valid",
+			client: &mockKubernetesClient{},
+			config: &Config{},
+		},
 		{
 			name:    "nil client",
 			client:  nil,
 			config:  &Config{},
-			vip:     "100.81.89.100",
-			wantErr: true,
-			errMsg:  "kubernetes client cannot be nil",
+			wantErr: "kubernetes client cannot be nil",
 		},
 		{
 			name:    "nil config",
 			client:  &mockKubernetesClient{},
 			config:  nil,
-			vip:     "100.81.89.100",
-			wantErr: true,
-			errMsg:  "config cannot be nil",
-		},
-		{
-			name:    "empty VIP",
-			client:  &mockKubernetesClient{},
-			config:  &Config{},
-			vip:     "",
-			wantErr: true,
-			errMsg:  "VIP cannot be empty",
-		},
-		{
-			name:    "valid parameters",
-			client:  &mockKubernetesClient{},
-			config:  &Config{},
-			vip:     "100.81.89.100",
-			wantErr: false,
+			wantErr: "config cannot be nil",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			installer, err := NewCRDInstaller(tt.client, tt.config, tt.vip)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("NewCRDInstaller() error = %v, wantErr %v", err, tt.wantErr)
+			installer, err := NewCRDInstaller(tt.client, tt.config)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
 				return
 			}
-			if err != nil && tt.errMsg != "" && err.Error() != tt.errMsg {
-				t.Errorf("NewCRDInstaller() error message = %q, want %q", err.Error(), tt.errMsg)
-				return
-			}
-			if !tt.wantErr && installer == nil {
-				t.Error("NewCRDInstaller() returned nil installer without error")
-			}
+			require.NoError(t, err)
+			assert.NotNil(t, installer)
 		})
 	}
 }
 
-func TestCRDInstaller_GenerateConnectorManifest(t *testing.T) {
-	tests := []struct {
-		name           string
-		config         *Config
-		vip            string
-		wantRoutes     []string
-		wantTags       []string
-		wantName       string
-		wantNamespace  string
-		wantAPIVersion string
-		wantKind       string
-	}{
-		{
-			name: "minimal config - VIP only",
-			config: &Config{
-				Tags:            []string{},
-				AdvertiseRoutes: []string{},
-			},
-			vip:            "100.81.89.100",
-			wantRoutes:     []string{"100.81.89.100/32"},
-			wantTags:       []string{"tag:k8s-foundry"},
-			wantName:       "foundry-vip-connector",
-			wantNamespace:  "tailscale",
-			wantAPIVersion: "tailscale.com/v1alpha1",
-			wantKind:       "Connector",
-		},
-		{
-			name: "VIP with additional routes",
-			config: &Config{
-				Tags:            []string{},
-				AdvertiseRoutes: []string{"10.0.0.0/8", "192.168.0.0/16"},
-			},
-			vip:            "100.81.89.100",
-			wantRoutes:     []string{"100.81.89.100/32", "10.0.0.0/8", "192.168.0.0/16"},
-			wantTags:       []string{"tag:k8s-foundry"},
-			wantName:       "foundry-vip-connector",
-			wantNamespace:  "tailscale",
-			wantAPIVersion: "tailscale.com/v1alpha1",
-			wantKind:       "Connector",
-		},
-		{
-			name: "custom tags",
-			config: &Config{
-				Tags:            []string{"tag:production", "tag:us-west"},
-				AdvertiseRoutes: []string{},
-			},
-			vip:            "100.81.89.100",
-			wantRoutes:     []string{"100.81.89.100/32"},
-			wantTags:       []string{"tag:k8s-foundry", "tag:production", "tag:us-west"},
-			wantName:       "foundry-vip-connector",
-			wantNamespace:  "tailscale",
-			wantAPIVersion: "tailscale.com/v1alpha1",
-			wantKind:       "Connector",
-		},
-		{
-			name: "full config",
-			config: &Config{
-				Tags:            []string{"tag:production"},
-				AdvertiseRoutes: []string{"10.0.0.0/8"},
-			},
-			vip:            "100.125.196.1",
-			wantRoutes:     []string{"100.125.196.1/32", "10.0.0.0/8"},
-			wantTags:       []string{"tag:k8s-foundry", "tag:production"},
-			wantName:       "foundry-vip-connector",
-			wantNamespace:  "tailscale",
-			wantAPIVersion: "tailscale.com/v1alpha1",
-			wantKind:       "Connector",
-		},
-	}
+// TestDeployConnectorNeverAdvertisesClusterInternalNetworks is the guard for the
+// maintainer's requirement that the API VIP stay internal to the cluster.
+//
+// The Connector previously advertised the VIP as a /32 subnet route, which put
+// cluster traffic on the tailnet. Nothing derived from the cluster's own
+// networks may appear in advertiseRoutes — only routes the operator explicitly
+// configured.
+func TestDeployConnectorNeverAdvertisesClusterInternalNetworks(t *testing.T) {
+	client := &mockKubernetesClient{}
+	installer, err := NewCRDInstaller(client, &Config{
+		AdvertiseRoutes: []string{testExtraRoute},
+	})
+	require.NoError(t, err)
+	require.NoError(t, installer.DeployConnector(context.Background()))
 
-	for _, tt := range tests {
+	require.Len(t, client.manifestsApplied, 1)
+	routes := connectorRoutes(t, client.manifestsApplied[0])
+
+	assert.Equal(t, []string{testExtraRoute}, routes)
+
+	// Assert on the rendered manifest as a whole so no field reintroduces the
+	// VIP by another route.
+	rendered := fmt.Sprintf("%v", client.manifestsApplied[0])
+	for _, internal := range []string{testAPIVIP, testPodCIDR, testSvcCIDR} {
+		assert.NotContains(t, rendered, internal,
+			"cluster-internal network %s must never appear in the Connector", internal)
+	}
+}
+
+// TestDeployConnectorSkippedWithoutRoutes covers the default posture: with no
+// advertise_routes configured, no Connector is created at all. A Connector
+// exists only to advertise routes, so an empty one would be meaningless.
+func TestDeployConnectorSkippedWithoutRoutes(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		routes []string
+	}{
+		{"nil routes", nil},
+		{"empty routes", []string{}},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &mockKubernetesClient{}
-			installer, err := NewCRDInstaller(client, tt.config, tt.vip)
-			if err != nil {
-				t.Fatalf("NewCRDInstaller() unexpected error: %v", err)
-			}
+			installer, err := NewCRDInstaller(client, &Config{AdvertiseRoutes: tt.routes})
+			require.NoError(t, err)
 
-			manifest, err := installer.generateConnectorManifest()
-			if err != nil {
-				t.Fatalf("generateConnectorManifest() unexpected error: %v", err)
-			}
-
-			// Verify API version
-			if apiVersion, ok := manifest["apiVersion"].(string); !ok || apiVersion != tt.wantAPIVersion {
-				t.Errorf("apiVersion = %q, want %q", apiVersion, tt.wantAPIVersion)
-			}
-
-			// Verify kind
-			if kind, ok := manifest["kind"].(string); !ok || kind != tt.wantKind {
-				t.Errorf("kind = %q, want %q", kind, tt.wantKind)
-			}
-
-			// Verify metadata
-			metadata, ok := manifest["metadata"].(map[string]interface{})
-			if !ok {
-				t.Fatal("metadata is not a map")
-			}
-			if name, ok := metadata["name"].(string); !ok || name != tt.wantName {
-				t.Errorf("metadata.name = %q, want %q", name, tt.wantName)
-			}
-			if namespace, ok := metadata["namespace"].(string); !ok || namespace != tt.wantNamespace {
-				t.Errorf("metadata.namespace = %q, want %q", namespace, tt.wantNamespace)
-			}
-
-			// Verify spec
-			spec, ok := manifest["spec"].(map[string]interface{})
-			if !ok {
-				t.Fatal("spec is not a map")
-			}
-
-			// Verify tags
-			tags, ok := spec["tags"].([]string)
-			if !ok {
-				t.Fatal("spec.tags is not a string slice")
-			}
-			if !reflect.DeepEqual(tags, tt.wantTags) {
-				t.Errorf("spec.tags = %v, want %v", tags, tt.wantTags)
-			}
-
-			// Verify subnet router
-			subnetRouter, ok := spec["subnetRouter"].(map[string]interface{})
-			if !ok {
-				t.Fatal("spec.subnetRouter is not a map")
-			}
-			routes, ok := subnetRouter["advertiseRoutes"].([]string)
-			if !ok {
-				t.Fatal("spec.subnetRouter.advertiseRoutes is not a string slice")
-			}
-			if !reflect.DeepEqual(routes, tt.wantRoutes) {
-				t.Errorf("spec.subnetRouter.advertiseRoutes = %v, want %v", routes, tt.wantRoutes)
-			}
+			require.NoError(t, installer.DeployConnector(context.Background()))
+			assert.Empty(t, client.manifestsApplied, "no Connector should be applied")
 		})
 	}
 }
 
-func TestCRDInstaller_GenerateDNSConfigManifest(t *testing.T) {
-	tests := []struct {
-		name           string
-		wantName       string
-		wantNamespace  string
-		wantAPIVersion string
-		wantKind       string
-		wantImageRepo  string
-		wantImageTag   string
-	}{
-		{
-			name:           "default DNSConfig",
-			wantName:       "ts-dns",
-			wantNamespace:  "tailscale",
-			wantAPIVersion: "tailscale.com/v1alpha1",
-			wantKind:       "DNSConfig",
-			wantImageRepo:  "tailscale/k8s-nameserver",
-			wantImageTag:   "unstable",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := &mockKubernetesClient{}
-			config := &Config{
-				Tags:            []string{},
-				AdvertiseRoutes: []string{},
-			}
-			installer, err := NewCRDInstaller(client, config, "100.81.89.100")
-			if err != nil {
-				t.Fatalf("NewCRDInstaller() unexpected error: %v", err)
-			}
-
-			manifest, err := installer.generateDNSConfigManifest()
-			if err != nil {
-				t.Fatalf("generateDNSConfigManifest() unexpected error: %v", err)
-			}
-
-			// Verify API version
-			if apiVersion, ok := manifest["apiVersion"].(string); !ok || apiVersion != tt.wantAPIVersion {
-				t.Errorf("apiVersion = %q, want %q", apiVersion, tt.wantAPIVersion)
-			}
-
-			// Verify kind
-			if kind, ok := manifest["kind"].(string); !ok || kind != tt.wantKind {
-				t.Errorf("kind = %q, want %q", kind, tt.wantKind)
-			}
-
-			// Verify metadata
-			metadata, ok := manifest["metadata"].(map[string]interface{})
-			if !ok {
-				t.Fatal("metadata is not a map")
-			}
-			if name, ok := metadata["name"].(string); !ok || name != tt.wantName {
-				t.Errorf("metadata.name = %q, want %q", name, tt.wantName)
-			}
-			if namespace, ok := metadata["namespace"].(string); !ok || namespace != tt.wantNamespace {
-				t.Errorf("metadata.namespace = %q, want %q", namespace, tt.wantNamespace)
-			}
-
-			// Verify spec
-			spec, ok := manifest["spec"].(map[string]interface{})
-			if !ok {
-				t.Fatal("spec is not a map")
-			}
-
-			// Verify nameserver
-			nameserver, ok := spec["nameserver"].(map[string]interface{})
-			if !ok {
-				t.Fatal("spec.nameserver is not a map")
-			}
-
-			// Verify image
-			image, ok := nameserver["image"].(map[string]interface{})
-			if !ok {
-				t.Fatal("spec.nameserver.image is not a map")
-			}
-			if repo, ok := image["repo"].(string); !ok || repo != tt.wantImageRepo {
-				t.Errorf("spec.nameserver.image.repo = %q, want %q", repo, tt.wantImageRepo)
-			}
-			if tag, ok := image["tag"].(string); !ok || tag != tt.wantImageTag {
-				t.Errorf("spec.nameserver.image.tag = %q, want %q", tag, tt.wantImageTag)
-			}
+func TestDeployConnector(t *testing.T) {
+	t.Run("advertises exactly the configured routes", func(t *testing.T) {
+		client := &mockKubernetesClient{}
+		installer, err := NewCRDInstaller(client, &Config{
+			AdvertiseRoutes: []string{testLANRoute, testExtraRoute},
 		})
-	}
+		require.NoError(t, err)
+		require.NoError(t, installer.DeployConnector(context.Background()))
+
+		require.Len(t, client.manifestsApplied, 1)
+		assert.Equal(t, []string{testLANRoute, testExtraRoute},
+			connectorRoutes(t, client.manifestsApplied[0]))
+	})
+
+	t.Run("uses the default tag when none configured", func(t *testing.T) {
+		client := &mockKubernetesClient{}
+		installer, err := NewCRDInstaller(client, &Config{
+			AdvertiseRoutes: []string{testExtraRoute},
+		})
+		require.NoError(t, err)
+		require.NoError(t, installer.DeployConnector(context.Background()))
+
+		assert.Equal(t, []string{DefaultTag}, connectorTags(t, client.manifestsApplied[0]))
+	})
+
+	// Configured tags previously had the default appended, so a caller asking
+	// for exactly one tag got two.
+	t.Run("configured tags replace the default rather than appending", func(t *testing.T) {
+		client := &mockKubernetesClient{}
+		installer, err := NewCRDInstaller(client, &Config{
+			Tags:            []string{"tag:production"},
+			AdvertiseRoutes: []string{testExtraRoute},
+		})
+		require.NoError(t, err)
+		require.NoError(t, installer.DeployConnector(context.Background()))
+
+		assert.Equal(t, []string{"tag:production"}, connectorTags(t, client.manifestsApplied[0]))
+	})
+
+	t.Run("does not mutate the configured route slice", func(t *testing.T) {
+		routes := []string{testExtraRoute}
+		client := &mockKubernetesClient{}
+		installer, err := NewCRDInstaller(client, &Config{AdvertiseRoutes: routes})
+		require.NoError(t, err)
+		require.NoError(t, installer.DeployConnector(context.Background()))
+
+		assert.Equal(t, []string{testExtraRoute}, routes, "config slice must not be modified")
+	})
+
+	t.Run("propagates apply failure", func(t *testing.T) {
+		client := &mockKubernetesClient{applyErr: fmt.Errorf("apply rejected")}
+		installer, err := NewCRDInstaller(client, &Config{AdvertiseRoutes: []string{testExtraRoute}})
+		require.NoError(t, err)
+
+		err = installer.DeployConnector(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "apply rejected")
+	})
+
+	t.Run("targets the tailscale namespace", func(t *testing.T) {
+		client := &mockKubernetesClient{}
+		installer, err := NewCRDInstaller(client, &Config{AdvertiseRoutes: []string{testExtraRoute}})
+		require.NoError(t, err)
+		require.NoError(t, installer.DeployConnector(context.Background()))
+
+		metadata := client.manifestsApplied[0]["metadata"].(map[string]interface{})
+		assert.Equal(t, DefaultNamespace, metadata["namespace"])
+		assert.Equal(t, "tailscale.com/v1alpha1", client.manifestsApplied[0]["apiVersion"])
+		assert.Equal(t, "Connector", client.manifestsApplied[0]["kind"])
+	})
 }
 
-func TestCRDInstaller_DeployConnector(t *testing.T) {
-	tests := []struct {
-		name      string
-		client    *mockKubernetesClient
-		config    *Config
-		vip       string
-		wantErr   bool
-		errMsg    string
-		wantCalls int
-	}{
-		{
-			name: "successful deployment",
-			client: &mockKubernetesClient{
-				manifestsApplied: []map[string]interface{}{},
-			},
-			config: &Config{
-				Tags:            []string{},
-				AdvertiseRoutes: []string{},
-			},
-			vip:       "100.81.89.100",
-			wantErr:   false,
-			wantCalls: 1,
-		},
-		{
-			name: "apply error",
-			client: &mockKubernetesClient{
-				applyErr: fmt.Errorf("kubernetes API error"),
-			},
-			config: &Config{
-				Tags:            []string{},
-				AdvertiseRoutes: []string{},
-			},
-			vip:     "100.81.89.100",
-			wantErr: true,
-			errMsg:  "failed to apply Connector CRD: kubernetes API error",
-		},
-	}
+func TestDeployDNSConfig(t *testing.T) {
+	t.Run("applies a DNSConfig", func(t *testing.T) {
+		client := &mockKubernetesClient{}
+		installer, err := NewCRDInstaller(client, &Config{})
+		require.NoError(t, err)
+		require.NoError(t, installer.DeployDNSConfig(context.Background()))
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			installer, err := NewCRDInstaller(tt.client, tt.config, tt.vip)
-			if err != nil {
-				t.Fatalf("NewCRDInstaller() unexpected error: %v", err)
-			}
+		require.Len(t, client.manifestsApplied, 1)
+		assert.Equal(t, "DNSConfig", client.manifestsApplied[0]["kind"])
+		assert.Equal(t, "tailscale.com/v1alpha1", client.manifestsApplied[0]["apiVersion"])
+	})
 
-			err = installer.DeployConnector(context.Background())
-			if (err != nil) != tt.wantErr {
-				t.Errorf("DeployConnector() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if err != nil && tt.errMsg != "" && err.Error() != tt.errMsg {
-				t.Errorf("DeployConnector() error message = %q, want %q", err.Error(), tt.errMsg)
-				return
-			}
+	// DNSConfig makes tailnet names resolvable from inside the cluster; it does
+	// not advertise anything outward, so it is safe without routes.
+	t.Run("applied even with no advertise routes", func(t *testing.T) {
+		client := &mockKubernetesClient{}
+		installer, err := NewCRDInstaller(client, &Config{})
+		require.NoError(t, err)
+		require.NoError(t, installer.DeployDNSConfig(context.Background()))
+		assert.Len(t, client.manifestsApplied, 1)
+	})
 
-			if !tt.wantErr {
-				if len(tt.client.manifestsApplied) != tt.wantCalls {
-					t.Errorf("Apply() called %d times, want %d", len(tt.client.manifestsApplied), tt.wantCalls)
-				}
+	t.Run("propagates apply failure", func(t *testing.T) {
+		client := &mockKubernetesClient{applyErr: fmt.Errorf("apply rejected")}
+		installer, err := NewCRDInstaller(client, &Config{})
+		require.NoError(t, err)
 
-				// Verify Connector manifest was applied
-				if len(tt.client.manifestsApplied) > 0 {
-					manifest := tt.client.manifestsApplied[0]
-					if kind, ok := manifest["kind"].(string); !ok || kind != "Connector" {
-						t.Errorf("Applied manifest kind = %q, want %q", kind, "Connector")
-					}
-				}
-			}
-		})
-	}
+		err = installer.DeployDNSConfig(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "apply rejected")
+	})
 }
 
-func TestCRDInstaller_DeployDNSConfig(t *testing.T) {
-	tests := []struct {
-		name      string
-		client    *mockKubernetesClient
-		config    *Config
-		vip       string
-		wantErr   bool
-		errMsg    string
-		wantCalls int
-	}{
-		{
-			name: "successful deployment",
-			client: &mockKubernetesClient{
-				manifestsApplied: []map[string]interface{}{},
-			},
-			config: &Config{
-				Tags:            []string{},
-				AdvertiseRoutes: []string{},
-			},
-			vip:       "100.81.89.100",
-			wantErr:   false,
-			wantCalls: 1,
-		},
-		{
-			name: "apply error",
-			client: &mockKubernetesClient{
-				applyErr: fmt.Errorf("kubernetes API error"),
-			},
-			config: &Config{
-				Tags:            []string{},
-				AdvertiseRoutes: []string{},
-			},
-			vip:     "100.81.89.100",
-			wantErr: true,
-			errMsg:  "failed to apply DNSConfig CRD: kubernetes API error",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			installer, err := NewCRDInstaller(tt.client, tt.config, tt.vip)
-			if err != nil {
-				t.Fatalf("NewCRDInstaller() unexpected error: %v", err)
-			}
-
-			err = installer.DeployDNSConfig(context.Background())
-			if (err != nil) != tt.wantErr {
-				t.Errorf("DeployDNSConfig() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if err != nil && tt.errMsg != "" && err.Error() != tt.errMsg {
-				t.Errorf("DeployDNSConfig() error message = %q, want %q", err.Error(), tt.errMsg)
-				return
-			}
-
-			if !tt.wantErr {
-				if len(tt.client.manifestsApplied) != tt.wantCalls {
-					t.Errorf("Apply() called %d times, want %d", len(tt.client.manifestsApplied), tt.wantCalls)
-				}
-
-				// Verify DNSConfig manifest was applied
-				if len(tt.client.manifestsApplied) > 0 {
-					manifest := tt.client.manifestsApplied[0]
-					if kind, ok := manifest["kind"].(string); !ok || kind != "DNSConfig" {
-						t.Errorf("Applied manifest kind = %q, want %q", kind, "DNSConfig")
-					}
-				}
-			}
-		})
-	}
+// connectorRoutes extracts spec.subnetRouter.advertiseRoutes as strings.
+func connectorRoutes(t *testing.T, manifest map[string]interface{}) []string {
+	t.Helper()
+	spec, ok := manifest["spec"].(map[string]interface{})
+	require.True(t, ok, "manifest has no spec")
+	router, ok := spec["subnetRouter"].(map[string]interface{})
+	require.True(t, ok, "spec has no subnetRouter")
+	raw, ok := router["advertiseRoutes"].([]string)
+	require.True(t, ok, "subnetRouter has no advertiseRoutes")
+	return raw
 }
 
-func TestCRDInstaller_Integration(t *testing.T) {
-	// Integration test: Deploy both Connector and DNSConfig
-	client := &mockKubernetesClient{
-		manifestsApplied: []map[string]interface{}{},
-	}
-	config := &Config{
-		Tags:            []string{"tag:production"},
-		AdvertiseRoutes: []string{"10.0.0.0/8"},
-	}
-	vip := "100.81.89.100"
+// connectorTags extracts spec.tags as strings.
+func connectorTags(t *testing.T, manifest map[string]interface{}) []string {
+	t.Helper()
+	spec, ok := manifest["spec"].(map[string]interface{})
+	require.True(t, ok, "manifest has no spec")
+	tags, ok := spec["tags"].([]string)
+	require.True(t, ok, "spec has no tags")
+	return tags
+}
 
-	installer, err := NewCRDInstaller(client, config, vip)
-	if err != nil {
-		t.Fatalf("NewCRDInstaller() unexpected error: %v", err)
-	}
+// TestConnectorManifestHasNoVIPField is a belt-and-braces check that no key or
+// value anywhere in the rendered Connector mentions a VIP.
+func TestConnectorManifestHasNoVIPField(t *testing.T) {
+	client := &mockKubernetesClient{}
+	installer, err := NewCRDInstaller(client, &Config{AdvertiseRoutes: []string{testExtraRoute}})
+	require.NoError(t, err)
+	require.NoError(t, installer.DeployConnector(context.Background()))
 
-	// Deploy Connector
-	if err := installer.DeployConnector(context.Background()); err != nil {
-		t.Fatalf("DeployConnector() unexpected error: %v", err)
-	}
-
-	// Deploy DNSConfig
-	if err := installer.DeployDNSConfig(context.Background()); err != nil {
-		t.Fatalf("DeployDNSConfig() unexpected error: %v", err)
-	}
-
-	// Verify both manifests were applied
-	if len(client.manifestsApplied) != 2 {
-		t.Fatalf("Expected 2 manifests applied, got %d", len(client.manifestsApplied))
-	}
-
-	// Verify first manifest is Connector
-	connectorManifest := client.manifestsApplied[0]
-	if kind, ok := connectorManifest["kind"].(string); !ok || kind != "Connector" {
-		t.Errorf("First manifest kind = %q, want %q", kind, "Connector")
-	}
-
-	// Verify second manifest is DNSConfig
-	dnsConfigManifest := client.manifestsApplied[1]
-	if kind, ok := dnsConfigManifest["kind"].(string); !ok || kind != "DNSConfig" {
-		t.Errorf("Second manifest kind = %q, want %q", kind, "DNSConfig")
-	}
+	rendered := strings.ToLower(fmt.Sprintf("%v", client.manifestsApplied[0]))
+	assert.NotContains(t, rendered, "vip")
 }

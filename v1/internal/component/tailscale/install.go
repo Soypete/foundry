@@ -3,104 +3,176 @@ package tailscale
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 const (
 	// DefaultNamespace is the namespace where Tailscale operator will be installed
 	DefaultNamespace = "tailscale"
+
+	// DefaultTag is the ACL tag applied to operator-managed devices when the
+	// config does not specify any.
+	DefaultTag = "tag:k8s-foundry"
+
+	// OAuthSecretName is the Kubernetes secret holding the operator's OAuth
+	// client credentials.
+	OAuthSecretName = "operator-oauth"
 )
 
-// Installer handles Tailscale operator installation and configuration.
+// Installer deploys the Tailscale operator and its custom resources.
+//
+// It owns the ordering of the install steps; the Helm and CRD mechanics live in
+// HelmInstaller and CRDInstaller. Each step converges rather than recreating, so
+// a second run makes no changes.
 type Installer struct {
-	config *Config
-	vip    string
+	helm    *HelmInstaller
+	crds    *CRDInstaller
+	secrets SecretWriter
+	config  *Config
 }
 
-// NewInstaller creates a new Tailscale installer with the given configuration.
-func NewInstaller(cfg *Config, vip string) (*Installer, error) {
+// SecretWriter creates or updates the Kubernetes secret carrying the operator's
+// OAuth credentials. The credentials are passed this way rather than as Helm
+// values so they are not persisted in the Helm release.
+type SecretWriter interface {
+	EnsureSecret(ctx context.Context, namespace, name string, data map[string]string) error
+}
+
+// NewInstaller creates a Tailscale installer.
+//
+// The API VIP is deliberately not a parameter: nothing in the Tailscale
+// installation may reference it. The VIP is internal to the cluster data plane,
+// and advertising it on the tailnet is what previously placed cluster traffic
+// on Tailscale.
+func NewInstaller(helmInstaller *HelmInstaller, crdInstaller *CRDInstaller, secrets SecretWriter, cfg *Config) (*Installer, error) {
+	if helmInstaller == nil {
+		return nil, fmt.Errorf("helm installer cannot be nil")
+	}
+	if crdInstaller == nil {
+		return nil, fmt.Errorf("crd installer cannot be nil")
+	}
+	if secrets == nil {
+		return nil, fmt.Errorf("secret writer cannot be nil")
+	}
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
-
-	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-
-	// Set defaults
 	cfg.SetDefaults()
 
 	return &Installer{
-		config: cfg,
-		vip:    vip,
+		helm:    helmInstaller,
+		crds:    crdInstaller,
+		secrets: secrets,
+		config:  cfg,
 	}, nil
 }
 
-// Install performs the complete Tailscale operator installation.
-// This is the main entry point called by the Foundry stack installer.
+// Install deploys the operator and reconciles its custom resources.
+//
+// Idempotent: the OAuth secret is written with the same content, the Helm
+// release is upgraded in place when it already exists (including one installed
+// outside Foundry), and the custom resources are applied rather than created.
 func (i *Installer) Install(ctx context.Context) error {
-	// Step 1: Validate prerequisites
-	if err := i.validatePrerequisites(ctx); err != nil {
-		return fmt.Errorf("prerequisites check failed: %w", err)
+	// Step 1: OAuth credentials must exist before the operator starts, or it
+	// crash-loops waiting for them.
+	data, err := GenerateSecretData(i.config)
+	if err != nil {
+		return fmt.Errorf("failed to build OAuth secret: %w", err)
+	}
+	if err := i.secrets.EnsureSecret(ctx, DefaultNamespace, OAuthSecretName, data); err != nil {
+		return fmt.Errorf("failed to write OAuth secret: %w", err)
 	}
 
-	// Step 2: Create namespace
-	if err := i.createNamespace(ctx); err != nil {
-		return fmt.Errorf("failed to create namespace: %w", err)
+	// Step 2: Chart repository.
+	if err := i.helm.AddRepository(ctx); err != nil {
+		return fmt.Errorf("failed to add Helm repository: %w", err)
 	}
 
-	// Step 3: Install operator via Helm (PR #2c implementation)
-	// NOTE: Helm client will be passed in constructor in PR #2f (stack integration)
-	// For now, this is documented but not wired up
-	// helmInstaller := NewHelmInstaller(helmClient, i.config)
-	// if err := helmInstaller.AddRepository(ctx); err != nil {
-	//     return fmt.Errorf("failed to add Helm repository: %w", err)
-	// }
-	// if err := helmInstaller.InstallOperator(ctx); err != nil {
-	//     return fmt.Errorf("failed to install operator: %w", err)
-	// }
+	// Step 3: Operator, adopting any existing release.
+	if err := i.helm.InstallOperator(ctx); err != nil {
+		return fmt.Errorf("failed to install Tailscale operator: %w", err)
+	}
 
-	// TODO (PR #2d): Deploy Connector CRD
-	// TODO (PR #2d): Deploy DNSConfig CRD
-	// TODO (PR #2e): Patch CoreDNS
+	// Step 4: DNSConfig, so tailnet names resolve inside the cluster.
+	if err := i.crds.DeployDNSConfig(ctx); err != nil {
+		return fmt.Errorf("failed to deploy DNSConfig: %w", err)
+	}
+
+	// Step 5: Connector, only when subnet routes are configured. Never
+	// advertises cluster-internal networks.
+	if err := i.crds.DeployConnector(ctx); err != nil {
+		return fmt.Errorf("failed to deploy Connector: %w", err)
+	}
 
 	return nil
 }
 
-// Uninstall removes the Tailscale operator and all associated resources.
+// Uninstall removes the Tailscale operator Helm release.
+//
+// The custom resources it owns are removed by the operator's own cleanup; the
+// OAuth secret is left in place so a reinstall does not require re-entering
+// credentials.
 func (i *Installer) Uninstall(ctx context.Context) error {
-	// TODO: Implement uninstall logic
-	return fmt.Errorf("uninstall not yet implemented")
-}
-
-// Status returns the current status of the Tailscale operator installation.
-func (i *Installer) Status(ctx context.Context) (string, error) {
-	// TODO: Implement status check
-	return "not implemented", nil
-}
-
-// validatePrerequisites checks that all required dependencies are available.
-func (i *Installer) validatePrerequisites(ctx context.Context) error {
-	// TODO (PR #2b): Check K3s is running
-	// TODO (PR #2g): Check OpenBAO is available (for secrets)
-
-	// For now, just validate config again
-	if err := i.config.Validate(); err != nil {
-		return fmt.Errorf("configuration invalid: %w", err)
+	if err := i.helm.UninstallOperator(ctx); err != nil {
+		return fmt.Errorf("failed to uninstall Tailscale operator: %w", err)
 	}
-
-	// Validate VIP is set
-	if i.vip == "" {
-		return fmt.Errorf("VIP cannot be empty")
-	}
-
 	return nil
 }
 
-// createNamespace creates the Tailscale namespace if it doesn't exist.
-func (i *Installer) createNamespace(ctx context.Context) error {
-	// TODO (PR #2b): Actually create namespace via Kubernetes client
-	// For now, this is a stub that will be implemented when we have
-	// access to the Kubernetes client (passed in constructor or via context)
-	return fmt.Errorf("createNamespace not yet implemented")
+// Health describes the observable state of the Tailscale integration.
+type Health struct {
+	// Installed reports whether the operator Helm release is present.
+	Installed bool
+
+	// ReleaseStatus is the Helm release status (e.g. "deployed").
+	ReleaseStatus string
+
+	// OperatorAddress is the operator's tailnet address, empty when unknown.
+	OperatorAddress string
+
+	// Ingresses are the Tailscale-backed ingress endpoints and their state.
+	Ingresses []Ingress
+}
+
+// Ingress is one Tailscale-exposed service.
+type Ingress struct {
+	Name     string
+	Hostname string
+	Ready    bool
+}
+
+// Healthy reports whether the operator is deployed and every discovered
+// ingress is ready.
+func (h Health) Healthy() bool {
+	if !h.Installed || !strings.EqualFold(h.ReleaseStatus, "deployed") {
+		return false
+	}
+	for _, ing := range h.Ingresses {
+		if !ing.Ready {
+			return false
+		}
+	}
+	return true
+}
+
+// Summary renders a one-line description of the integration's state.
+func (h Health) Summary() string {
+	if !h.Installed {
+		return "Tailscale operator is not installed"
+	}
+	ready := 0
+	for _, ing := range h.Ingresses {
+		if ing.Ready {
+			ready++
+		}
+	}
+	addr := h.OperatorAddress
+	if addr == "" {
+		addr = "unknown"
+	}
+	return fmt.Sprintf("operator %s at %s; %d/%d ingress ready",
+		h.ReleaseStatus, addr, ready, len(h.Ingresses))
 }
