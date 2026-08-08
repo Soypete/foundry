@@ -820,7 +820,11 @@ func TestValidateTailscaleConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "error - tailscale enabled but missing credentials",
+			// Credentials absent from stack.yaml is valid: OpenBAO is the
+			// authoritative store and may already hold them. It is reported as
+			// an advisory warning instead -- see
+			// TestWarnMissingTailscaleCredentials.
+			name: "valid - tailscale enabled with credentials only in OpenBAO",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -849,8 +853,7 @@ func TestValidateTailscaleConfig(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
-			errMsg:  "Tailscale is enabled but OAuth credentials are missing",
+			wantErr: false,
 		},
 		{
 			name: "valid - tailscale disabled",
