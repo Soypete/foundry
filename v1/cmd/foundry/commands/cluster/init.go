@@ -58,11 +58,11 @@ func applyHostNetwork(h *host.Host, cfg *k3s.Config) {
 	}
 }
 
+// apiClientAddress is the endpoint remote clients use to reach the API server.
+// The rule lives in the k3s package so the install/repair path applies the same
+// one; see k3s.ClientEndpoint.
 func apiClientAddress(h *host.Host, vip string) string {
-	if h.TailscaleAddress != "" {
-		return h.TailscaleAddress
-	}
-	return vip
+	return k3s.ClientEndpoint(h.TailscaleAddress, vip)
 }
 
 func initCommand() *cli.Command {

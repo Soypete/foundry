@@ -806,6 +806,152 @@ func installK3sComponent(ctx context.Context, stackConfig *config.Config, connec
 		fmt.Println("\n✓ All nodes reconciled")
 	}
 
+	if err := reconcileKubeconfigEndpoint(ctx, stackConfig, dryRun); err != nil {
+		// The nodes are already converged; a stale client endpoint should not
+		// fail the install, but the user must be told it was not repaired.
+		fmt.Printf("\n⚠ Warning: kubeconfig endpoint not updated: %v\n", err)
+	}
+
+	return nil
+}
+
+// kubeconfigClientEndpoint returns the address remote clients should use to
+// reach the API server, derived from the first control plane host. Returns ""
+// when there is no cluster to point at, or when neither a Tailscale address nor
+// a VIP is configured.
+func kubeconfigClientEndpoint(stackConfig *config.Config) string {
+	if stackConfig == nil {
+		return ""
+	}
+	cpHosts := stackConfig.GetClusterControlPlaneHosts()
+	if len(cpHosts) == 0 {
+		return ""
+	}
+	return k3s.ClientEndpoint(cpHosts[0].TailscaleAddress, stackConfig.Cluster.VIP)
+}
+
+// reconcileKubeconfigEndpoint re-points the stored kubeconfig at the address
+// remote clients should use — the control plane's Tailscale address when one is
+// configured, otherwise the API VIP.
+//
+// This is the repair path for a kubeconfig written before its control plane had
+// a Tailscale address: node reconciliation alone never touches the kubeconfig,
+// so the endpoint would otherwise stay stale forever. Idempotent — a kubeconfig
+// already pointing at the right endpoint is left untouched.
+func reconcileKubeconfigEndpoint(ctx context.Context, stackConfig *config.Config, dryRun bool) error {
+	if dryRun {
+		endpoint := kubeconfigClientEndpoint(stackConfig)
+		if endpoint == "" {
+			return nil
+		}
+		fmt.Printf("\n[dry-run] Would ensure kubeconfig points at %s\n", k3s.KubeconfigServerURL(endpoint))
+		return nil
+	}
+
+	return reconcileKubeconfigEndpointWithClient(ctx, stackConfig, func() (k3s.KubeconfigClient, error) {
+		return createOpenBAOClient(stackConfig)
+	})
+}
+
+// kubeconfigClientFactory opens the secret store holding the kubeconfig.
+// Injected so the reconcile path can be tested without a live OpenBAO.
+type kubeconfigClientFactory func() (k3s.KubeconfigClient, error)
+
+// reconcileKubeconfigEndpointWithClient is the non-dry-run body of
+// reconcileKubeconfigEndpoint, with the secret-store dependency injected.
+func reconcileKubeconfigEndpointWithClient(ctx context.Context, stackConfig *config.Config, newClient kubeconfigClientFactory) error {
+	endpoint := kubeconfigClientEndpoint(stackConfig)
+	if endpoint == "" {
+		return nil
+	}
+
+	client, err := newClient()
+	if err != nil {
+		return fmt.Errorf("failed to create OpenBAO client: %w", err)
+	}
+
+	// The OpenBAO copy and the local ~/.foundry/kubeconfig are independent
+	// stores that can disagree — an endpoint fixed in one may still be stale in
+	// the other. Reconcile each against its own current state rather than
+	// gating the local mirror on whether OpenBAO happened to need a write.
+	storedChanged, err := k3s.RefreshStoredKubeconfig(ctx, client, endpoint)
+	if err != nil {
+		return err
+	}
+
+	if storedChanged {
+		fmt.Printf("\n✓ Kubeconfig endpoint updated to %s\n", k3s.KubeconfigServerURL(endpoint))
+	} else {
+		fmt.Printf("\n✓ Kubeconfig endpoint unchanged (%s)\n", k3s.KubeconfigServerURL(endpoint))
+	}
+
+	// Mirror to ~/.foundry/kubeconfig, which is what every other foundry command
+	// and the user's kubectl actually read.
+	exportedChanged, err := exportKubeconfigIfStale(ctx, client, endpoint)
+	if err != nil {
+		return fmt.Errorf("stored in OpenBAO but local export failed: %w", err)
+	}
+
+	configDir, cfgErr := config.GetConfigDir()
+	kubeconfigPath := "~/.foundry/kubeconfig"
+	if cfgErr == nil {
+		kubeconfigPath = filepath.Join(configDir, "kubeconfig")
+	}
+	if exportedChanged {
+		fmt.Printf("✓ Kubeconfig exported to %s\n", kubeconfigPath)
+	} else {
+		fmt.Printf("✓ Local kubeconfig already current (%s)\n", kubeconfigPath)
+	}
+
+	return nil
+}
+
+// exportKubeconfigIfStale writes the stored kubeconfig to ~/.foundry/kubeconfig
+// unless the local file already targets endpoint, returning whether it wrote.
+//
+// The local file is checked on its own terms: it can be stale while the copy in
+// OpenBAO is already correct, so its freshness cannot be inferred from whether
+// OpenBAO needed updating.
+func exportKubeconfigIfStale(ctx context.Context, client k3s.KubeconfigClient, endpoint string) (bool, error) {
+	configDir, err := config.GetConfigDir()
+	if err != nil {
+		return false, fmt.Errorf("failed to get config directory: %w", err)
+	}
+
+	existing, err := os.ReadFile(filepath.Join(configDir, "kubeconfig"))
+	if err == nil && k3s.KubeconfigTargets(string(existing), endpoint) {
+		return false, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("failed to read local kubeconfig: %w", err)
+	}
+
+	if err := exportKubeconfig(ctx, client); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// exportKubeconfig writes the kubeconfig stored in OpenBAO to ~/.foundry/kubeconfig.
+func exportKubeconfig(ctx context.Context, client k3s.KubeconfigClient) error {
+	kubeconfig, err := k3s.LoadKubeconfig(ctx, client)
+	if err != nil {
+		return fmt.Errorf("failed to load kubeconfig from OpenBAO: %w", err)
+	}
+
+	configDir, err := config.GetConfigDir()
+	if err != nil {
+		return fmt.Errorf("failed to get config directory: %w", err)
+	}
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	kubeconfigPath := filepath.Join(configDir, "kubeconfig")
+	if err := os.WriteFile(kubeconfigPath, []byte(kubeconfig), 0600); err != nil {
+		return fmt.Errorf("failed to write kubeconfig: %w", err)
+	}
+
 	return nil
 }
 

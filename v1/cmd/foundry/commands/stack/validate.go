@@ -3,6 +3,7 @@ package stack
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
@@ -57,6 +58,16 @@ func runStackValidate(ctx context.Context, cmd *cli.Command) error {
 
 	fmt.Println()
 	fmt.Println("✓ All validation checks passed")
+
+	// Advisory findings: valid configurations that will not behave as the
+	// operator probably intends. These never fail validation.
+	if warnings := collectConfigWarnings(cfg); len(warnings) > 0 {
+		fmt.Println()
+		for _, w := range warnings {
+			fmt.Printf("⚠ %s\n", w)
+		}
+	}
+
 	fmt.Println()
 	fmt.Println("Your stack configuration is valid and ready for installation.")
 	fmt.Println("Run 'foundry stack install' to deploy the stack.")
@@ -197,6 +208,46 @@ func validateComponentDependencies(cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+// collectConfigWarnings returns advisory messages about configurations that are
+// valid but will not behave as intended. Unlike the validation checks, these
+// never fail the command.
+func collectConfigWarnings(cfg *config.Config) []string {
+	var warnings []string
+	warnings = append(warnings, warnMissingControlPlaneTailscaleAddress(cfg)...)
+	return warnings
+}
+
+// warnMissingControlPlaneTailscaleAddress flags control plane hosts with no
+// tailscale_address.
+//
+// Without one, the generated kubeconfig falls back to the API VIP, which is
+// internal to the cluster data plane — so remote kubectl works only from the
+// LAN. The address is also what gets added to the API certificate SANs, so it
+// must be set before provisioning for remote access to work at all.
+func warnMissingControlPlaneTailscaleAddress(cfg *config.Config) []string {
+	cpHosts := cfg.GetClusterControlPlaneHosts()
+	if len(cpHosts) == 0 {
+		return nil
+	}
+
+	var missing []string
+	for _, h := range cpHosts {
+		if h.TailscaleAddress == "" {
+			missing = append(missing, h.Hostname)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	return []string{fmt.Sprintf(
+		"Control plane host(s) %s have no tailscale_address. Remote kubectl will use "+
+			"the API VIP %q, which is only reachable from the cluster LAN. Set "+
+			"tailscale_address on each control plane host, then run "+
+			"'foundry component install k3s' to update the kubeconfig endpoint.",
+		strings.Join(missing, ", "), cfg.Cluster.VIP)}
 }
 
 // validateTailscaleConfig validates Tailscale configuration if enabled
