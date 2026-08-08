@@ -291,7 +291,7 @@ func TestValidateNetworkConfig(t *testing.T) {
 				},
 			},
 			wantErr: true,
-			errMsg:  "not in network",
+			errMsg:  "outside network",
 		},
 		{
 			name: "DHCP conflict",
@@ -703,9 +703,10 @@ func TestRunStackValidate_Integration(t *testing.T) {
 			},
 		}
 
-		// Should fail on network validation (VIP not on same network)
+		// Network validation passes: an off-LAN VIP is legitimate (kube-vip
+		// carries it as a /32) and the host's address is on the LAN.
 		err := validateNetworkConfig(invalidCfg)
-		assert.Error(t, err)
+		assert.NoError(t, err)
 
 		// Should fail on DNS validation (no infrastructure zones)
 		err = validateDNSConfig(invalidCfg)
@@ -820,7 +821,11 @@ func TestValidateTailscaleConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "error - tailscale enabled but missing credentials",
+			// Credentials absent from stack.yaml is valid: OpenBAO is the
+			// authoritative store and may already hold them. It is reported as
+			// an advisory warning instead -- see
+			// TestWarnMissingTailscaleCredentials.
+			name: "valid - tailscale enabled with credentials only in OpenBAO",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -849,8 +854,7 @@ func TestValidateTailscaleConfig(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
-			errMsg:  "Tailscale is enabled but OAuth credentials are missing",
+			wantErr: false,
 		},
 		{
 			name: "valid - tailscale disabled",

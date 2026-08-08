@@ -6,6 +6,7 @@ import (
 
 	"github.com/catalystcommunity/foundry/v1/cmd/foundry/registry"
 	"github.com/catalystcommunity/foundry/v1/internal/component"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/host"
 	"github.com/stretchr/testify/assert"
@@ -225,4 +226,87 @@ func TestValidateComponentDependenciesAgainstRealRegistry(t *testing.T) {
 		Components: config.ComponentMap{"openbao": {}},
 	})
 	assert.NoError(t, err, "every name in validateComponentDependencies must exist in the real registry")
+}
+
+// TestWarnMissingTailscaleCredentials covers the advisory for Tailscale enabled
+// without credentials in stack.yaml.
+//
+// This must not be a validation failure: OpenBAO is the authoritative store, so
+// a config that never carried credentials literally is valid. Whether they
+// resolve is decided at install time, which is the only place with a client.
+func TestWarnMissingTailscaleCredentials(t *testing.T) {
+	tsComponent := func(cfg map[string]interface{}) *config.Config {
+		return &config.Config{
+			Cluster:    config.ClusterConfig{VIP: warnVIP},
+			Components: config.ComponentMap{"tailscale": {Config: cfg}},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		cfg         *config.Config
+		wantWarning bool
+	}{
+		{
+			name:        "enabled with no credentials warns",
+			cfg:         tsComponent(map[string]interface{}{}),
+			wantWarning: true,
+		},
+		{
+			name: "secret references count as present",
+			cfg: tsComponent(map[string]interface{}{
+				"oauth_client_id":     "${secret:tailscale:client_id}",
+				"oauth_client_secret": "${secret:tailscale:client_secret}",
+			}),
+			wantWarning: false,
+		},
+		{
+			name: "literal credentials count as present",
+			cfg: tsComponent(map[string]interface{}{
+				"oauth_client_id":     "literal-id",
+				"oauth_client_secret": "literal-secret",
+			}),
+			wantWarning: false,
+		},
+		{
+			name: "only one credential still warns",
+			cfg: tsComponent(map[string]interface{}{
+				"oauth_client_id": "${secret:tailscale:client_id}",
+			}),
+			wantWarning: true,
+		},
+		{
+			name:        "explicitly disabled does not warn",
+			cfg:         tsComponent(map[string]interface{}{"enabled": false}),
+			wantWarning: false,
+		},
+		{
+			name:        "component absent does not warn",
+			cfg:         &config.Config{Cluster: config.ClusterConfig{VIP: warnVIP}},
+			wantWarning: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			warnings := warnMissingTailscaleCredentials(tt.cfg)
+			if !tt.wantWarning {
+				assert.Empty(t, warnings)
+				return
+			}
+			require.Len(t, warnings, 1)
+			assert.Contains(t, warnings[0], "OpenBAO")
+			assert.Contains(t, warnings[0], tailscale.DocsURL)
+		})
+	}
+}
+
+// TestValidateTailscaleConfigNeverFailsOnMissingCredentials guards the change
+// from a hard failure to an advisory: a config whose credentials live only in
+// OpenBAO must still validate.
+func TestValidateTailscaleConfigNeverFailsOnMissingCredentials(t *testing.T) {
+	cfg := &config.Config{
+		Components: config.ComponentMap{"tailscale": {Config: map[string]interface{}{}}},
+	}
+	assert.NoError(t, validateTailscaleConfig(cfg))
 }

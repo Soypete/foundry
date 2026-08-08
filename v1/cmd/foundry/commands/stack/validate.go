@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/network"
 	"github.com/urfave/cli/v3"
@@ -230,6 +231,7 @@ func validateComponentDependencies(cfg *config.Config) error {
 func collectConfigWarnings(cfg *config.Config) []string {
 	var warnings []string
 	warnings = append(warnings, warnMissingControlPlaneTailscaleAddress(cfg)...)
+	warnings = append(warnings, warnMissingTailscaleCredentials(cfg)...)
 	return warnings
 }
 
@@ -286,13 +288,36 @@ func validateTailscaleConfig(cfg *config.Config) error {
 		return nil
 	}
 
-	// Tailscale is enabled - check for OAuth credentials
-	clientID, hasClientID := tsCfg.Config["oauth_client_id"].(string)
-	clientSecret, hasClientSecret := tsCfg.Config["oauth_client_secret"].(string)
+	// Credentials may legitimately be absent from this file: OpenBAO is the
+	// authoritative store, and a config that never carried them literally is
+	// valid. Whether they actually resolve is decided at install time, which is
+	// the only place with an OpenBAO client. Surface it as advice instead.
+	return nil
+}
 
-	if !hasClientID || !hasClientSecret || clientID == "" || clientSecret == "" {
-		return fmt.Errorf("Tailscale is enabled but OAuth credentials are missing. To create OAuth credentials, visit: %s", tailscaleDocsURL)
+// warnMissingTailscaleCredentials flags Tailscale enabled with no OAuth
+// credentials in either the config or a secret reference.
+func warnMissingTailscaleCredentials(cfg *config.Config) []string {
+	if cfg.Components == nil {
+		return nil
+	}
+	tsCfg, exists := cfg.Components["tailscale"]
+	if !exists {
+		return nil
+	}
+	if enabled, ok := tsCfg.Config["enabled"].(bool); ok && !enabled {
+		return nil
 	}
 
-	return nil
+	clientID, _ := tsCfg.Config["oauth_client_id"].(string)
+	clientSecret, _ := tsCfg.Config["oauth_client_secret"].(string)
+	if clientID != "" && clientSecret != "" {
+		return nil
+	}
+
+	return []string{fmt.Sprintf(
+		"Tailscale is enabled but stack.yaml carries no OAuth credentials. They must "+
+			"already be in OpenBAO at %s/%s, or 'foundry component install tailscale' "+
+			"will fail. To create an OAuth client: %s",
+		tailscale.SecretMount, tailscale.SecretPath, tailscaleDocsURL)}
 }
