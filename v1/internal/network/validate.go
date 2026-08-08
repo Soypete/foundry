@@ -25,29 +25,53 @@ func ValidateIPs(fullCfg *config.Config) error {
 		return fmt.Errorf("failed to calculate network CIDR: %w", err)
 	}
 
-	// Validate all infrastructure IPs are on the same network (from hosts and VIP)
-	var allIPs []string
-	if fullCfg.Cluster.VIP != "" {
-		allIPs = append(allIPs, fullCfg.Cluster.VIP)
-	}
+	// Only addresses that belong to the LAN data plane are checked against the
+	// LAN subnet. Other planes legitimately live elsewhere:
+	//
+	//   - The API VIP is commonly a /32 that kube-vip carries as a secondary
+	//     address on the LAN interface without being a member of the LAN subnet.
+	//   - A host's `address` is the SSH/management address, which is a CGNAT
+	//     100.64.0.0/10 address when nodes are reached over Tailscale.
+	//   - `tailscale_address` is never on the LAN by definition.
+	//
+	// See docs/network-planes.md. Each host's LAN address is its `node_ip`,
+	// defaulting to `address` when that is itself a LAN IP.
 	for _, h := range fullCfg.Hosts {
-		if h.Address != "" {
-			allIPs = append(allIPs, h.Address)
+		lanAddr := h.NodeIP
+		if lanAddr == "" {
+			// Without an explicit node_ip, `address` doubles as the LAN
+			// address — but only when it is not an overlay address.
+			if h.Address == "" || isCGNAT(h.Address) {
+				continue
+			}
+			lanAddr = h.Address
 		}
-	}
 
-	for _, ipStr := range allIPs {
-		ip := net.ParseIP(ipStr)
+		ip := net.ParseIP(lanAddr)
 		if ip == nil {
-			return fmt.Errorf("invalid IP address: %s", ipStr)
+			return fmt.Errorf("invalid IP address for host %s: %s", h.Hostname, lanAddr)
 		}
-
 		if !network.Contains(ip) {
-			return fmt.Errorf("IP %s is not in network %s", ipStr, network.String())
+			return fmt.Errorf("host %s has node IP %s outside network %s",
+				h.Hostname, lanAddr, network.String())
 		}
 	}
 
 	return nil
+}
+
+// isCGNAT reports whether an address is in the RFC 6598 shared address space
+// (100.64.0.0/10) that Tailscale and other overlays use.
+func isCGNAT(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	_, cgnat, err := net.ParseCIDR("100.64.0.0/10")
+	if err != nil {
+		return false
+	}
+	return cgnat.Contains(ip)
 }
 
 // CheckReachability checks if the given IPs are reachable via ping
