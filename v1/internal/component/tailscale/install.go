@@ -184,9 +184,9 @@ func (h Health) AddressDescription() string {
 	}
 	switch h.AddressState {
 	case AddressServiceMissing:
-		return "no operator service found"
+		return "operator not found"
 	case AddressNotAssigned:
-		return "not yet registered on the tailnet"
+		return "operator found but its tailnet identity is unreadable"
 	default:
 		return "unknown"
 	}

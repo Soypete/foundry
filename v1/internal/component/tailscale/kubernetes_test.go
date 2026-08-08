@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -363,5 +364,113 @@ func TestListTailscaleIngresses(t *testing.T) {
 		list, err := adapter.ListTailscaleIngresses(context.Background())
 		require.NoError(t, err)
 		assert.Len(t, list, 2)
+	})
+}
+
+// operatorDeployment builds an operator Deployment carrying a tailnet hostname.
+func operatorDeployment(name, hostname string, labels map[string]string) *appsv1.Deployment {
+	env := []corev1.EnvVar{{Name: "APISERVER_PROXY", Value: "false"}}
+	if hostname != "" {
+		env = append(env, corev1.EnvVar{Name: operatorHostnameEnv, Value: hostname})
+	}
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: DefaultNamespace, Labels: labels},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "operator", Env: env}},
+				},
+			},
+		},
+	}
+}
+
+// TestOperatorAddressWithoutAPIServerProxy is the regression test for reporting
+// a healthy operator as unregistered.
+//
+// With APISERVER_PROXY=false the operator creates no Service for itself -- only
+// headless proxy Services for the workloads it manages. Inferring registration
+// from Service status therefore said "not yet registered" about an operator
+// that was online with a tailnet identity. The identity comes from the
+// Deployment, which exists in either mode.
+func TestOperatorAddressWithoutAPIServerProxy(t *testing.T) {
+	t.Run("reads the hostname from the deployment when no service exists", func(t *testing.T) {
+		adapter := newTestAdapter(t, operatorDeployment("operator", "tailscale-operator", nil))
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "tailscale-operator", addr)
+		assert.Equal(t, AddressFound, state,
+			"an operator with APISERVER_PROXY=false is registered, not missing")
+	})
+
+	t.Run("finds the deployment under its alternate name", func(t *testing.T) {
+		adapter := newTestAdapter(t, operatorDeployment("tailscale-operator", "ts-op", nil))
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "ts-op", addr)
+		assert.Equal(t, AddressFound, state)
+	})
+
+	t.Run("finds the deployment by label", func(t *testing.T) {
+		adapter := newTestAdapter(t, operatorDeployment("custom-name", "ts-op",
+			map[string]string{"app.kubernetes.io/name": "tailscale-operator"}))
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "ts-op", addr)
+		assert.Equal(t, AddressFound, state)
+	})
+
+	// A deployed operator whose hostname cannot be read is not "missing".
+	t.Run("deployment without a hostname is not-assigned rather than missing", func(t *testing.T) {
+		adapter := newTestAdapter(t, operatorDeployment("operator", "", nil))
+
+		_, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, AddressNotAssigned, state)
+	})
+
+	t.Run("nothing deployed at all is missing", func(t *testing.T) {
+		adapter := newTestAdapter(t)
+
+		_, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, AddressServiceMissing, state)
+	})
+
+	// The Deployment is authoritative, so a stale Service cannot override it.
+	t.Run("deployment hostname wins over a service address", func(t *testing.T) {
+		adapter := newTestAdapter(t,
+			operatorDeployment("operator", "from-deployment", nil),
+			&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: operatorServiceName, Namespace: DefaultNamespace},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{
+					Ingress: []corev1.LoadBalancerIngress{{Hostname: "from-service"}},
+				}},
+			})
+
+		addr, _, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "from-deployment", addr)
+	})
+
+	// With the API-server proxy on there is a Service, and it is still used
+	// when the Deployment carries no hostname.
+	t.Run("falls back to the service when the deployment has no hostname", func(t *testing.T) {
+		adapter := newTestAdapter(t,
+			operatorDeployment("operator", "", nil),
+			&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: operatorServiceName, Namespace: DefaultNamespace},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{
+					Ingress: []corev1.LoadBalancerIngress{{Hostname: "proxy.ts.net"}},
+				}},
+			})
+
+		addr, state, err := adapter.OperatorAddressState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "proxy.ts.net", addr)
+		assert.Equal(t, AddressFound, state)
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -153,8 +154,7 @@ func gvrForManifest(obj *unstructured.Unstructured) (schema.GroupVersionResource
 	return gv.WithResource(resource), nil
 }
 
-// OperatorAddress returns the operator's tailnet address, taken from its
-// Service's LoadBalancer ingress.
+// OperatorAddress returns the operator's tailnet address.
 //
 // Returns "" when no address is available. Use OperatorAddressState to tell
 // apart the reasons, which are operationally different.
@@ -167,52 +167,122 @@ func (k *KubeAdapter) OperatorAddress(ctx context.Context) (string, error) {
 type AddressState int
 
 const (
-	// AddressFound means a tailnet address was read from the Service.
+	// AddressFound means a tailnet address or hostname was discovered.
 	AddressFound AddressState = iota
 
-	// AddressServiceMissing means no operator Service could be found. The
-	// operator is not deployed, or its Service is named and labelled
-	// unconventionally.
+	// AddressServiceMissing means the operator could not be located at all --
+	// neither its Deployment nor an API-server-proxy Service was found.
 	AddressServiceMissing
 
-	// AddressNotAssigned means the Service exists but carries no LoadBalancer
-	// address: the operator has not registered with the tailnet. Normal while
-	// starting up, a fault if it persists.
+	// AddressNotAssigned means the operator was found but no tailnet identity
+	// could be read from it. Normal while starting up, a fault if it persists.
 	AddressNotAssigned
 )
+
+// operatorDeploymentNames are the Deployment names the operator is known by,
+// most to least likely.
+var operatorDeploymentNames = []string{"operator", "tailscale-operator"}
+
+// operatorHostnameEnv is the environment variable carrying the operator's own
+// tailnet hostname. It is set regardless of whether the API-server proxy is
+// enabled, which makes it the authoritative source for the operator's identity.
+const operatorHostnameEnv = "OPERATOR_HOSTNAME"
 
 // OperatorAddressState returns the operator's tailnet address along with why it
 // is empty when it is.
 //
-// Collapsing "no Service" and "Service with no address" into a bare "" hides a
-// real distinction: the first says the operator is absent or misidentified, the
-// second says it is running but has not joined the tailnet. Only the second is
-// a normal transient state.
+// The operator's identity is read from its Deployment rather than inferred from
+// a Service. A Service exists only when the API-server proxy is enabled, so
+// treating its absence as "not registered" reports a healthy operator as broken
+// whenever APISERVER_PROXY is off.
+//
+// The two empty results are distinct: "could not find the operator" and "found
+// it but read no tailnet identity" call for different action, and only the
+// second is a normal transient state.
 func (k *KubeAdapter) OperatorAddressState(ctx context.Context) (string, AddressState, error) {
+	// The operator's own tailnet hostname, from its Deployment. This is the
+	// authoritative source: the operator has a tailnet identity whenever it is
+	// running, whether or not the API-server proxy is enabled.
+	hostname, deploymentFound, err := k.operatorHostname(ctx)
+	if err != nil {
+		return "", AddressServiceMissing, err
+	}
+	if hostname != "" {
+		return hostname, AddressFound, nil
+	}
+
+	// Otherwise fall back to an API-server-proxy Service, which exists only
+	// when that mode is on.
 	svc, err := k.findOperatorService(ctx)
 	if err != nil {
 		return "", AddressServiceMissing, err
 	}
-	if svc == nil {
-		return "", AddressServiceMissing, nil
-	}
-
-	for _, ing := range svc.Status.LoadBalancer.Ingress {
-		if ing.Hostname != "" {
-			return ing.Hostname, AddressFound, nil
+	if svc != nil {
+		for _, ing := range svc.Status.LoadBalancer.Ingress {
+			if ing.Hostname != "" {
+				return ing.Hostname, AddressFound, nil
+			}
+			if ing.IP != "" {
+				return ing.IP, AddressFound, nil
+			}
 		}
-		if ing.IP != "" {
-			return ing.IP, AddressFound, nil
+		if svc.Spec.ExternalName != "" {
+			return svc.Spec.ExternalName, AddressFound, nil
+		}
+		return "", AddressNotAssigned, nil
+	}
+
+	// A running operator with no readable hostname is registered but opaque to
+	// us; only when nothing was found at all is the operator genuinely absent.
+	if deploymentFound {
+		return "", AddressNotAssigned, nil
+	}
+	return "", AddressServiceMissing, nil
+}
+
+// operatorHostname reads the operator's tailnet hostname from its Deployment,
+// and reports whether the Deployment was found at all.
+func (k *KubeAdapter) operatorHostname(ctx context.Context) (hostname string, found bool, err error) {
+	deployments := k.clientset.AppsV1().Deployments(DefaultNamespace)
+
+	var deploy *appsv1.Deployment
+	for _, name := range operatorDeploymentNames {
+		d, getErr := deployments.Get(ctx, name, metav1.GetOptions{})
+		if getErr == nil {
+			deploy = d
+			break
+		}
+		if !apierrors.IsNotFound(getErr) {
+			return "", false, fmt.Errorf("failed to read operator deployment: %w", getErr)
 		}
 	}
 
-	// The operator also publishes its address as an external name on some
-	// chart versions; fall back to it before reporting nothing.
-	if svc.Spec.ExternalName != "" {
-		return svc.Spec.ExternalName, AddressFound, nil
+	if deploy == nil {
+		for _, selector := range operatorSelectors {
+			list, listErr := deployments.List(ctx, metav1.ListOptions{LabelSelector: selector})
+			if listErr != nil {
+				return "", false, fmt.Errorf("failed to list deployments by %q: %w", selector, listErr)
+			}
+			if len(list.Items) > 0 {
+				deploy = &list.Items[0]
+				break
+			}
+		}
 	}
 
-	return "", AddressNotAssigned, nil
+	if deploy == nil {
+		return "", false, nil
+	}
+
+	for _, container := range deploy.Spec.Template.Spec.Containers {
+		for _, env := range container.Env {
+			if env.Name == operatorHostnameEnv && env.Value != "" {
+				return env.Value, true, nil
+			}
+		}
+	}
+
+	return "", true, nil
 }
 
 // findOperatorService locates the operator's Service, returning nil when there

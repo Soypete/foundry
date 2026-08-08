@@ -125,7 +125,7 @@ func TestHealthCheck(t *testing.T) {
 		health, err := checker.Check(context.Background())
 		require.NoError(t, err)
 		assert.Empty(t, health.OperatorAddress)
-		assert.Contains(t, health.Summary(), "not yet registered on the tailnet")
+		assert.Contains(t, health.Summary(), "tailnet identity is unreadable")
 	})
 
 	t.Run("a non-deployed release is unhealthy", func(t *testing.T) {
@@ -290,12 +290,12 @@ func TestHealthAddressDescription(t *testing.T) {
 		{
 			name:   "no service found",
 			health: Health{AddressState: AddressServiceMissing},
-			want:   "no operator service found",
+			want:   "operator not found",
 		},
 		{
-			name:   "service exists but unregistered",
+			name:   "operator found but identity unreadable",
 			health: Health{AddressState: AddressNotAssigned},
-			want:   "not yet registered on the tailnet",
+			want:   "operator found but its tailnet identity is unreadable",
 		},
 	}
 
@@ -314,8 +314,8 @@ func TestHealthCheckPropagatesAddressState(t *testing.T) {
 		state AddressState
 		want  string
 	}{
-		{"missing service", AddressServiceMissing, "no operator service found"},
-		{"unregistered", AddressNotAssigned, "not yet registered on the tailnet"},
+		{"missing service", AddressServiceMissing, "operator not found"},
+		{"unregistered", AddressNotAssigned, "tailnet identity is unreadable"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			checker := newHealthChecker(t, &mockHelmClient{releases: deployedRelease()},
