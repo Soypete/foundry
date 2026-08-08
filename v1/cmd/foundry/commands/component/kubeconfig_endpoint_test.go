@@ -222,8 +222,8 @@ func TestReconcileKubeconfigEndpointRepairsStaleEndpoint(t *testing.T) {
 	assert.Contains(t, string(exported), "server: https://"+endpointTailscale+":6443")
 }
 
-// TestReconcileKubeconfigEndpointIsIdempotent asserts a second run converges
-// with no write and no local export.
+// TestReconcileKubeconfigEndpointIsIdempotent asserts a second run rewrites
+// neither store when both are already converged.
 func TestReconcileKubeconfigEndpointIsIdempotent(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("FOUNDRY_CONFIG_DIR", configDir)
@@ -235,13 +235,121 @@ func TestReconcileKubeconfigEndpointIsIdempotent(t *testing.T) {
 	require.NoError(t, reconcileKubeconfigEndpointWithClient(context.Background(), cfg, newClient))
 	require.Equal(t, 1, store.writes)
 
-	require.NoError(t, os.Remove(filepath.Join(configDir, "kubeconfig")))
+	path := filepath.Join(configDir, "kubeconfig")
+	before, err := os.Stat(path)
+	require.NoError(t, err)
 
 	require.NoError(t, reconcileKubeconfigEndpointWithClient(context.Background(), cfg, newClient))
-	assert.Equal(t, 1, store.writes, "second run must not write")
+	assert.Equal(t, 1, store.writes, "second run must not write to the secret store")
 
-	_, err := os.Stat(filepath.Join(configDir, "kubeconfig"))
-	assert.True(t, os.IsNotExist(err), "converged run must not re-export")
+	after, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, before.ModTime(), after.ModTime(), "converged local file must not be rewritten")
+}
+
+// TestReconcileKubeconfigEndpointRepairsStaleLocalFileWhenStoreIsCurrent is the
+// regression test for the Gate 3 validation failure (VALIDATION.md iteration 1).
+//
+// On the live cluster the OpenBAO copy already carried the Tailscale endpoint
+// while ~/.foundry/kubeconfig was still on the LAN address. The reconcile
+// reported "endpoint unchanged" and returned early, leaving the local file --
+// the one kubectl actually reads -- stale. The two stores are independent and
+// each must be reconciled against its own state.
+func TestReconcileKubeconfigEndpointRepairsStaleLocalFileWhenStoreIsCurrent(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("FOUNDRY_CONFIG_DIR", configDir)
+
+	// Secret store already correct; local file stale on the LAN endpoint.
+	store := &fakeSecretStore{kubeconfig: syntheticKubeconfig("https://" + endpointTailscale + ":6443")}
+	path := filepath.Join(configDir, "kubeconfig")
+	require.NoError(t, os.WriteFile(path, []byte(syntheticKubeconfig("https://"+endpointLAN+":6443")), 0600))
+
+	require.NoError(t, reconcileKubeconfigEndpointWithClient(
+		context.Background(), stackWithControlPlane(endpointTailscale),
+		func() (k3s.KubeconfigClient, error) { return store, nil },
+	))
+
+	assert.Equal(t, 0, store.writes, "an already-correct secret store must not be rewritten")
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(got), "server: https://"+endpointTailscale+":6443",
+		"stale local kubeconfig must be repaired even when the store is current")
+	assert.NotContains(t, string(got), endpointLAN)
+}
+
+// TestReconcileKubeconfigEndpointCreatesMissingLocalFile covers a local
+// kubeconfig that does not exist yet while the store is already correct.
+func TestReconcileKubeconfigEndpointCreatesMissingLocalFile(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("FOUNDRY_CONFIG_DIR", configDir)
+
+	store := &fakeSecretStore{kubeconfig: syntheticKubeconfig("https://" + endpointTailscale + ":6443")}
+
+	require.NoError(t, reconcileKubeconfigEndpointWithClient(
+		context.Background(), stackWithControlPlane(endpointTailscale),
+		func() (k3s.KubeconfigClient, error) { return store, nil },
+	))
+
+	got, err := os.ReadFile(filepath.Join(configDir, "kubeconfig"))
+	require.NoError(t, err, "a missing local kubeconfig must be created")
+	assert.Contains(t, string(got), "server: https://"+endpointTailscale+":6443")
+}
+
+func TestExportKubeconfigIfStale(t *testing.T) {
+	store := func() *fakeSecretStore {
+		return &fakeSecretStore{kubeconfig: syntheticKubeconfig("https://" + endpointTailscale + ":6443")}
+	}
+
+	t.Run("writes when the local file is stale", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("FOUNDRY_CONFIG_DIR", configDir)
+		path := filepath.Join(configDir, "kubeconfig")
+		require.NoError(t, os.WriteFile(path, []byte(syntheticKubeconfig("https://"+endpointLAN+":6443")), 0600))
+
+		wrote, err := exportKubeconfigIfStale(context.Background(), store(), endpointTailscale)
+		require.NoError(t, err)
+		assert.True(t, wrote)
+	})
+
+	t.Run("skips when the local file already targets the endpoint", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("FOUNDRY_CONFIG_DIR", configDir)
+		path := filepath.Join(configDir, "kubeconfig")
+		require.NoError(t, os.WriteFile(path, []byte(syntheticKubeconfig("https://"+endpointTailscale+":6443")), 0600))
+
+		wrote, err := exportKubeconfigIfStale(context.Background(), store(), endpointTailscale)
+		require.NoError(t, err)
+		assert.False(t, wrote)
+	})
+
+	t.Run("writes when the local file is missing", func(t *testing.T) {
+		t.Setenv("FOUNDRY_CONFIG_DIR", t.TempDir())
+		wrote, err := exportKubeconfigIfStale(context.Background(), store(), endpointTailscale)
+		require.NoError(t, err)
+		assert.True(t, wrote)
+	})
+
+	t.Run("rewrites an unparseable local file", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("FOUNDRY_CONFIG_DIR", configDir)
+		require.NoError(t, os.WriteFile(filepath.Join(configDir, "kubeconfig"), []byte("garbage"), 0600))
+
+		wrote, err := exportKubeconfigIfStale(context.Background(), store(), endpointTailscale)
+		require.NoError(t, err)
+		assert.True(t, wrote, "a file with no readable endpoint must be replaced")
+	})
+
+	t.Run("reports an unreadable local path", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("FOUNDRY_CONFIG_DIR", configDir)
+		// A directory where the file belongs makes the read fail with a
+		// non-IsNotExist error.
+		require.NoError(t, os.Mkdir(filepath.Join(configDir, "kubeconfig"), 0700))
+
+		_, err := exportKubeconfigIfStale(context.Background(), store(), endpointTailscale)
+		require.Error(t, err)
+	})
 }
 
 // TestReconcileKubeconfigEndpointFallsBackToVIP covers a control plane with no

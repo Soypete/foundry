@@ -870,30 +870,66 @@ func reconcileKubeconfigEndpointWithClient(ctx context.Context, stackConfig *con
 		return fmt.Errorf("failed to create OpenBAO client: %w", err)
 	}
 
-	changed, err := k3s.RefreshStoredKubeconfig(ctx, client, endpoint)
+	// The OpenBAO copy and the local ~/.foundry/kubeconfig are independent
+	// stores that can disagree — an endpoint fixed in one may still be stale in
+	// the other. Reconcile each against its own current state rather than
+	// gating the local mirror on whether OpenBAO happened to need a write.
+	storedChanged, err := k3s.RefreshStoredKubeconfig(ctx, client, endpoint)
 	if err != nil {
 		return err
 	}
 
-	if !changed {
+	if storedChanged {
+		fmt.Printf("\n✓ Kubeconfig endpoint updated to %s\n", k3s.KubeconfigServerURL(endpoint))
+	} else {
 		fmt.Printf("\n✓ Kubeconfig endpoint unchanged (%s)\n", k3s.KubeconfigServerURL(endpoint))
-		return nil
 	}
 
-	fmt.Printf("\n✓ Kubeconfig endpoint updated to %s\n", k3s.KubeconfigServerURL(endpoint))
-
-	// Mirror the refreshed kubeconfig to ~/.foundry/kubeconfig, which is what
-	// every other foundry command and the user's kubectl actually read.
-	if err := exportKubeconfig(ctx, client); err != nil {
+	// Mirror to ~/.foundry/kubeconfig, which is what every other foundry command
+	// and the user's kubectl actually read.
+	exportedChanged, err := exportKubeconfigIfStale(ctx, client, endpoint)
+	if err != nil {
 		return fmt.Errorf("stored in OpenBAO but local export failed: %w", err)
 	}
 
-	configDir, err := config.GetConfigDir()
-	if err == nil {
-		fmt.Printf("✓ Kubeconfig exported to %s\n", filepath.Join(configDir, "kubeconfig"))
+	configDir, cfgErr := config.GetConfigDir()
+	kubeconfigPath := "~/.foundry/kubeconfig"
+	if cfgErr == nil {
+		kubeconfigPath = filepath.Join(configDir, "kubeconfig")
+	}
+	if exportedChanged {
+		fmt.Printf("✓ Kubeconfig exported to %s\n", kubeconfigPath)
+	} else {
+		fmt.Printf("✓ Local kubeconfig already current (%s)\n", kubeconfigPath)
 	}
 
 	return nil
+}
+
+// exportKubeconfigIfStale writes the stored kubeconfig to ~/.foundry/kubeconfig
+// unless the local file already targets endpoint, returning whether it wrote.
+//
+// The local file is checked on its own terms: it can be stale while the copy in
+// OpenBAO is already correct, so its freshness cannot be inferred from whether
+// OpenBAO needed updating.
+func exportKubeconfigIfStale(ctx context.Context, client k3s.KubeconfigClient, endpoint string) (bool, error) {
+	configDir, err := config.GetConfigDir()
+	if err != nil {
+		return false, fmt.Errorf("failed to get config directory: %w", err)
+	}
+
+	existing, err := os.ReadFile(filepath.Join(configDir, "kubeconfig"))
+	if err == nil && k3s.KubeconfigTargets(string(existing), endpoint) {
+		return false, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("failed to read local kubeconfig: %w", err)
+	}
+
+	if err := exportKubeconfig(ctx, client); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // exportKubeconfig writes the kubeconfig stored in OpenBAO to ~/.foundry/kubeconfig.
