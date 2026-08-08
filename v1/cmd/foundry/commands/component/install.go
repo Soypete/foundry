@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
 	"github.com/catalystcommunity/foundry/v1/internal/component/certmanager"
@@ -24,6 +25,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/prometheus"
 	"github.com/catalystcommunity/foundry/v1/internal/component/seaweedfs"
 	componentStorage "github.com/catalystcommunity/foundry/v1/internal/component/storage"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/component/velero"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/dashboards"
@@ -126,6 +128,7 @@ var k8sComponents = map[string]bool{
 	"external-dns":       true,
 	"velero":             true,
 	"openbao-injector":   true,
+	"tailscale":          true,
 }
 
 func runInstall(ctx context.Context, cmd *cli.Command) error {
@@ -227,6 +230,13 @@ func installK8sComponent(ctx context.Context, cmd *cli.Command, name string, sta
 	// Add cluster VIP for components that need it
 	if stackConfig.Cluster.VIP != "" {
 		cfg["cluster_vip"] = stackConfig.Cluster.VIP
+	}
+
+	// Tailscale is wired by hand rather than through the Component interface:
+	// it needs OpenBAO for its OAuth credentials in addition to Helm and
+	// Kubernetes, and it writes back to the stack config.
+	if name == "tailscale" {
+		return installTailscaleComponent(ctx, cmd, stackConfig, helmClient, k8sClient)
 	}
 
 	// Create component-specific instance with clients and install
@@ -813,6 +823,143 @@ func installK3sComponent(ctx context.Context, stackConfig *config.Config, connec
 	}
 
 	return nil
+}
+
+// installTailscaleComponent installs or converges the Tailscale operator.
+//
+// The API VIP is deliberately not passed anywhere in this path: it is internal
+// to the cluster data plane, and advertising it on the tailnet is the topology
+// this work removed.
+func installTailscaleComponent(ctx context.Context, cmd *cli.Command, stackConfig *config.Config, helmClient *helm.Client, k8sClient *k8s.Client) error {
+	tsCfg, err := buildTailscaleConfig(ctx, cmd, stackConfig)
+	if err != nil {
+		return err
+	}
+
+	adapter, err := tailscale.NewKubeAdapter(k8sClient.Clientset(), k8sClient.DynamicClient())
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes adapter: %w", err)
+	}
+
+	helmInstaller, err := tailscale.NewHelmInstaller(helmClient, tsCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create Helm installer: %w", err)
+	}
+	crdInstaller, err := tailscale.NewCRDInstaller(adapter, tsCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create CRD installer: %w", err)
+	}
+	installer, err := tailscale.NewInstaller(helmInstaller, crdInstaller, adapter, tsCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create Tailscale installer: %w", err)
+	}
+
+	fmt.Println("\nInstalling component: tailscale")
+	if err := installer.Install(ctx); err != nil {
+		return fmt.Errorf("installation failed: %w", err)
+	}
+	fmt.Println("\n✓ Component tailscale installed successfully")
+
+	if len(tsCfg.AdvertiseRoutes) > 0 {
+		fmt.Printf("  Advertising subnet routes: %v\n", tsCfg.AdvertiseRoutes)
+	} else {
+		fmt.Println("  No subnet routes advertised (cluster networks stay internal)")
+	}
+
+	// Report what the operator is exposing, so a successful install says
+	// something useful rather than just "done".
+	checker, err := tailscale.NewHealthChecker(helmInstaller, adapter)
+	if err == nil {
+		if health, herr := checker.Check(ctx); herr == nil {
+			fmt.Printf("  %s\n", health.Summary())
+		}
+	}
+
+	return nil
+}
+
+// buildTailscaleConfig assembles the Tailscale component config from stack.yaml,
+// resolving OAuth credentials through OpenBAO.
+//
+// When credentials are supplied literally in stack.yaml they are written to
+// OpenBAO and the config is rewritten to reference them, so plaintext
+// credentials do not persist in the file.
+func buildTailscaleConfig(ctx context.Context, cmd *cli.Command, stackConfig *config.Config) (*tailscale.Config, error) {
+	compCfg := component.ComponentConfig{}
+	if comp, ok := stackConfig.Components["tailscale"]; ok {
+		for k, v := range comp.Config {
+			compCfg[k] = v
+		}
+	}
+
+	openbaoClient, err := createOpenBAOClient(stackConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OpenBAO client: %w\n\nTailscale credentials are stored in OpenBAO; install it first", err)
+	}
+
+	// A ${secret:...} reference means "read it from OpenBAO", so it is not a
+	// literal credential.
+	configID, _ := compCfg.GetString("oauth_client_id")
+	configSecret, _ := compCfg.GetString("oauth_client_secret")
+	if isSecretRef(configID) || isSecretRef(configSecret) {
+		configID, configSecret = "", ""
+	}
+
+	clientID, clientSecret, storedNew, err := tailscale.ResolveCredentials(ctx, openbaoClient, configID, configSecret)
+	if err != nil {
+		return nil, err
+	}
+	if storedNew {
+		fmt.Println("  ✓ Tailscale OAuth credentials stored in OpenBAO")
+		if err := replaceTailscaleCredentialRefs(cmd, stackConfig); err != nil {
+			fmt.Printf("  ⚠ Warning: credentials stored, but stack.yaml still holds them in plaintext: %v\n", err)
+		} else {
+			fmt.Println("  ✓ stack.yaml now references the stored credentials")
+		}
+	}
+
+	cfg := &tailscale.Config{
+		OAuthClientID:     &clientID,
+		OAuthClientSecret: &clientSecret,
+	}
+	if image, ok := compCfg.GetString("operator_image"); ok && image != "" {
+		cfg.OperatorImage = &image
+	}
+	if tags, ok := compCfg.GetStringSlice("tags"); ok {
+		cfg.Tags = tags
+	}
+	if routes, ok := compCfg.GetStringSlice("advertise_routes"); ok {
+		cfg.AdvertiseRoutes = routes
+	}
+
+	return cfg, nil
+}
+
+// replaceTailscaleCredentialRefs rewrites literal OAuth credentials in the
+// stack config as ${secret:...} references and saves it.
+func replaceTailscaleCredentialRefs(cmd *cli.Command, stackConfig *config.Config) error {
+	comp, ok := stackConfig.Components["tailscale"]
+	if !ok {
+		return fmt.Errorf("tailscale component not present in config")
+	}
+	if comp.Config == nil {
+		comp.Config = map[string]interface{}{}
+	}
+	comp.Config["oauth_client_id"] = "${secret:tailscale:client_id}"
+	comp.Config["oauth_client_secret"] = "${secret:tailscale:client_secret}"
+	stackConfig.Components["tailscale"] = comp
+
+	configPath, err := config.FindConfig(cmd.String("config"))
+	if err != nil {
+		return err
+	}
+	return config.Save(stackConfig, configPath)
+}
+
+// isSecretRef reports whether a config value is a ${secret:...} reference
+// rather than a literal credential.
+func isSecretRef(value string) bool {
+	return strings.HasPrefix(value, "${secret:") && strings.HasSuffix(value, "}")
 }
 
 // kubeconfigClientEndpoint returns the address remote clients should use to
