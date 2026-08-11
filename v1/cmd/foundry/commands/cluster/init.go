@@ -11,6 +11,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/openbao"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/host"
+	"github.com/catalystcommunity/foundry/v1/internal/network"
 	"github.com/catalystcommunity/foundry/v1/internal/setup"
 	"github.com/catalystcommunity/foundry/v1/internal/ssh"
 	"github.com/urfave/cli/v3"
@@ -64,13 +65,35 @@ func nodeIPForHost(h *host.Host) (string, error) {
 	return h.K3sNodeIP()
 }
 
-func applyHostNetwork(h *host.Host, cfg *k3s.Config, vip string) error {
-	nodeIP, err := nodeIPForHost(h)
+// nodeAddressForHost resolves a host's data plane address on the cluster's
+// configured substrate, which is the LAN unless network_substrate says
+// otherwise.
+func nodeAddressForHost(cfg *config.Config, h *host.Host) (string, error) {
+	substrate, err := network.NewSubstrate(cfg.Cluster.NetworkSubstrate)
+	if err != nil {
+		return "", err
+	}
+	if err := substrate.Validate(h, cfg.Cluster.VIP); err != nil {
+		return "", err
+	}
+	return substrate.NodeAddress(h)
+}
+
+func applyHostNetwork(h *host.Host, cfg *k3s.Config, stackCfg *config.Config) error {
+	substrate, err := network.NewSubstrate(stackCfg.Cluster.NetworkSubstrate)
+	if err != nil {
+		return err
+	}
+	nodeIP, err := nodeAddressForHost(stackCfg, h)
 	if err != nil {
 		return fmt.Errorf("host %s: %w", h.Hostname, err)
 	}
+	vip := stackCfg.Cluster.VIP
 	cfg.NodeIP = nodeIP
 	cfg.FlannelIface = h.FlannelInterface
+	if cfg.FlannelIface == "" {
+		cfg.FlannelIface = substrate.DefaultInterface()
+	}
 	if cfg.AdvertiseAddress == "" {
 		cfg.AdvertiseAddress = cfg.NodeIP
 	}
@@ -347,7 +370,7 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 		DisableComponents: []string{"traefik", "servicelb"},
 		AllowCGNATVIP:     cfg.Cluster.AllowCGNATVIP,
 	}
-	if err := applyHostNetwork(firstHost, k3sConfig, cfg.Cluster.VIP); err != nil {
+	if err := applyHostNetwork(firstHost, k3sConfig, cfg); err != nil {
 		return err
 	}
 	if err := k3s.ResolveNodeNetwork(conn, k3sConfig); err != nil {
@@ -420,7 +443,7 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 			EtcdArgs:          k3sConfig.EtcdArgs,
 			AllowCGNATVIP:     k3sConfig.AllowCGNATVIP,
 		}
-		if err := applyHostNetwork(h, joinConfig, cfg.Cluster.VIP); err != nil {
+		if err := applyHostNetwork(h, joinConfig, cfg); err != nil {
 			conn.Close()
 			return err
 		}
@@ -464,7 +487,7 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 			RegistryConfig: k3sConfig.RegistryConfig,
 			VIP:            cfg.Cluster.VIP,
 		}
-		if err := applyHostNetwork(h, workerConfig, cfg.Cluster.VIP); err != nil {
+		if err := applyHostNetwork(h, workerConfig, cfg); err != nil {
 			conn.Close()
 			return err
 		}

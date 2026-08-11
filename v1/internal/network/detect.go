@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/catalystcommunity/foundry/v1/internal/ssh"
 )
@@ -62,6 +64,64 @@ func InterfaceAddresses(conn SSHExecutor, iface string) ([]string, error) {
 		}
 	}
 	return addrs, nil
+}
+
+// DetectInterfaceMTU returns the MTU of an interface.
+//
+// Flannel derives its own MTU from the underlay, which is right on a 1500-byte
+// LAN and wrong on tailscale0, so the caller needs the real value to size the
+// pod MTU from.
+func DetectInterfaceMTU(conn SSHExecutor, iface string) (int, error) {
+	if iface == "" {
+		return 0, fmt.Errorf("interface name cannot be empty")
+	}
+
+	result, err := conn.Exec(fmt.Sprintf("cat /sys/class/net/%s/mtu", iface))
+	if err != nil {
+		return 0, fmt.Errorf("failed to detect MTU for %s: %w", iface, err)
+	}
+	if result.ExitCode != 0 {
+		return 0, fmt.Errorf("failed to detect MTU for %s: %s", iface, result.Stderr)
+	}
+
+	mtu, err := strconv.Atoi(strings.TrimSpace(result.Stdout))
+	if err != nil {
+		return 0, fmt.Errorf("unreadable MTU for %s: %q", iface, strings.TrimSpace(result.Stdout))
+	}
+	if mtu <= 0 {
+		return 0, fmt.Errorf("invalid MTU for %s: %d", iface, mtu)
+	}
+	return mtu, nil
+}
+
+// WaitForInterfaceAddress waits until an interface carries a specific address.
+//
+// K3s must not start before the interface Flannel is pinned to actually has its
+// address, or Flannel binds to whatever exists at that moment. Polling
+// DetectInterfaceForIP proves all three things at once: the address exists, it
+// is up, and it is on the interface the caller expects.
+func WaitForInterfaceAddress(conn SSHExecutor, iface, addr string, attempts int, delay time.Duration) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		found, err := DetectInterfaceForIP(conn, addr)
+		switch {
+		case err != nil:
+			lastErr = err
+		case found == iface:
+			return nil
+		default:
+			lastErr = fmt.Errorf("address %s is on %s, not %s", addr, found, iface)
+		}
+		if i < attempts-1 {
+			time.Sleep(delay)
+		}
+	}
+
+	return fmt.Errorf("%s does not carry %s: %w; bring the interface up before installing K3s", iface, addr, lastErr)
 }
 
 // SSHExecutor is an interface for executing SSH commands

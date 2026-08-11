@@ -32,6 +32,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/helm"
 	"github.com/catalystcommunity/foundry/v1/internal/host"
 	"github.com/catalystcommunity/foundry/v1/internal/k8s"
+	"github.com/catalystcommunity/foundry/v1/internal/network"
 	"github.com/catalystcommunity/foundry/v1/internal/secrets"
 	"github.com/catalystcommunity/foundry/v1/internal/ssh"
 	"github.com/urfave/cli/v3"
@@ -1125,8 +1126,15 @@ func reconcileK3sNodeWithConnector(ctx context.Context, stackConfig *config.Conf
 // Interface is deliberately left unset: it names a NIC (e.g. eth0), not an
 // address, and is detected on the node itself when kube-vip needs it.
 func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) (*k3s.Config, error) {
-	nodeIP, err := h.K3sNodeIP()
+	substrate, err := network.NewSubstrate(stackConfig.Cluster.NetworkSubstrate)
 	if err != nil {
+		return nil, err
+	}
+	nodeIP, err := substrate.NodeAddress(h)
+	if err != nil {
+		return nil, err
+	}
+	if err := substrate.Validate(h, stackConfig.Cluster.VIP); err != nil {
 		return nil, err
 	}
 	// The VIP is only carried into the node config when kube-vip is actually
@@ -1142,6 +1150,9 @@ func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) (*k3s.Config, 
 		k3sConfig.TLSSANs = append(k3sConfig.TLSSANs, stackConfig.Cluster.VIP)
 	}
 	k3sConfig.FlannelIface = h.FlannelInterface
+	if k3sConfig.FlannelIface == "" {
+		k3sConfig.FlannelIface = substrate.DefaultInterface()
+	}
 	k3sConfig.AdvertiseAddress = k3sConfig.NodeIP
 
 	// Parse additional registries from component config

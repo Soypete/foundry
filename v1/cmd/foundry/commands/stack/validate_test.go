@@ -922,3 +922,49 @@ func TestValidateTailscaleConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateNetworkSubstrate(t *testing.T) {
+	lanHost := func(name, addr string) *host.Host {
+		return &host.Host{Hostname: name, Address: addr, NodeIP: addr, Roles: []string{host.RoleClusterControlPlane}}
+	}
+	tsHost := func(name, addr, ts string) *host.Host {
+		return &host.Host{Hostname: name, Address: addr, TailscaleAddress: ts, Roles: []string{host.RoleClusterControlPlane}}
+	}
+
+	t.Run("an absent substrate validates as the LAN", func(t *testing.T) {
+		cfg := &config.Config{Hosts: []*host.Host{lanHost("blue1", "192.168.1.185")}}
+		require.NoError(t, validateNetworkSubstrate(cfg))
+	})
+
+	t.Run("an unknown substrate is rejected", func(t *testing.T) {
+		cfg := &config.Config{Cluster: config.ClusterConfig{NetworkSubstrate: "wireguard"}}
+		err := validateNetworkSubstrate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "wireguard")
+	})
+
+	t.Run("tailscale mode accepts hosts with tailnet addresses", func(t *testing.T) {
+		cfg := &config.Config{
+			Cluster: config.ClusterConfig{NetworkSubstrate: "tailscale"},
+			Hosts: []*host.Host{
+				tsHost("blue1", "192.168.1.185", "100.81.89.62"),
+				tsHost("blue2", "192.168.1.97", "100.125.196.1"),
+			},
+		}
+		require.NoError(t, validateNetworkSubstrate(cfg))
+	})
+
+	t.Run("tailscale mode names a host missing its tailnet address", func(t *testing.T) {
+		cfg := &config.Config{
+			Cluster: config.ClusterConfig{NetworkSubstrate: "tailscale"},
+			Hosts: []*host.Host{
+				tsHost("blue1", "192.168.1.185", "100.81.89.62"),
+				lanHost("refurb", "192.168.1.253"),
+			},
+		}
+		err := validateNetworkSubstrate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "refurb")
+		assert.Contains(t, err.Error(), "tailscale_address")
+	})
+}
