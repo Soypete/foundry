@@ -304,6 +304,45 @@ func InstallControlPlane(ctx context.Context, executor SSHExecutor, cfg *Config)
 	return reportStaleKubeVIP(executor, cfg)
 }
 
+// ApplyTailscaleOrdering writes the systemd drop-in that orders K3s after
+// tailscaled, and reloads systemd so it takes effect.
+//
+// Returns true when the drop-in changed, so the caller can decide whether a
+// restart is warranted.
+func ApplyTailscaleOrdering(executor SSHExecutor) (bool, error) {
+	content := GenerateTailscaleOrderingDropIn()
+
+	existing, _ := executor.Exec("sudo cat " + TailscaleOrderingDropInPath + " 2>/dev/null")
+	if existing != nil && strings.TrimSpace(existing.Stdout) == strings.TrimSpace(content) {
+		return false, nil
+	}
+
+	if result, err := executor.Exec("sudo mkdir -p /etc/systemd/system/k3s.service.d"); err != nil || result.ExitCode != 0 {
+		if err != nil {
+			return false, fmt.Errorf("failed to create the K3s systemd drop-in directory: %w", err)
+		}
+		return false, fmt.Errorf("failed to create the K3s systemd drop-in directory: exit code %d", result.ExitCode)
+	}
+
+	escaped := strings.ReplaceAll(content, "'", "'\"'\"'")
+	result, err := executor.Exec(fmt.Sprintf("echo '%s' | sudo tee %s >/dev/null", escaped, TailscaleOrderingDropInPath))
+	if err != nil {
+		return false, fmt.Errorf("failed to write the K3s systemd drop-in: %w", err)
+	}
+	if result.ExitCode != 0 {
+		return false, fmt.Errorf("failed to write the K3s systemd drop-in: exit code %d, stderr: %s", result.ExitCode, result.Stderr)
+	}
+
+	if result, err := executor.Exec("sudo systemctl daemon-reload"); err != nil || result.ExitCode != 0 {
+		if err != nil {
+			return false, fmt.Errorf("failed to reload systemd: %w", err)
+		}
+		return false, fmt.Errorf("failed to reload systemd: exit code %d", result.ExitCode)
+	}
+
+	return true, nil
+}
+
 // reportStaleKubeVIP warns when kube-vip is deployed on a cluster that no
 // longer wants a VIP, and returns without changing anything.
 //
@@ -358,6 +397,13 @@ func StaleKubeVIPNotice(vip, iface string) string {
 func updateNetworkConfig(executor SSHExecutor, cfg *Config, server bool) (bool, error) {
 	if cfg.NodeIP == "" && cfg.FlannelIface == "" && cfg.AdvertiseAddress == "" {
 		return false, nil
+	}
+	// When pod traffic rides the tailnet, K3s must not start before tailscaled
+	// has brought the interface up on every boot, not just at install time.
+	if cfg.FlannelIface == network.TailscaleInterface {
+		if _, err := ApplyTailscaleOrdering(executor); err != nil {
+			return false, err
+		}
 	}
 	content := GenerateNetworkConfigYAML(cfg, server)
 	existing, _ := executor.Exec("sudo cat " + NetworkConfigPath + " 2>/dev/null")

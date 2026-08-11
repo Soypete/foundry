@@ -3,6 +3,7 @@ package network
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/catalystcommunity/foundry/v1/internal/ssh"
 	"github.com/stretchr/testify/assert"
@@ -565,4 +566,95 @@ func TestListInterfaces(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDetectInterfaceMTU(t *testing.T) {
+	t.Run("parses the MTU", func(t *testing.T) {
+		conn := &funcSSHExecutor{execFunc: func(command string) (*ssh.ExecResult, error) {
+			assert.Contains(t, command, "/sys/class/net/tailscale0/mtu")
+			return &ssh.ExecResult{Stdout: "1280\n", ExitCode: 0}, nil
+		}}
+		mtu, err := DetectInterfaceMTU(conn, "tailscale0")
+		require.NoError(t, err)
+		assert.Equal(t, 1280, mtu)
+	})
+
+	t.Run("rejects unreadable output", func(t *testing.T) {
+		conn := &funcSSHExecutor{execFunc: func(string) (*ssh.ExecResult, error) {
+			return &ssh.ExecResult{Stdout: "not-a-number", ExitCode: 0}, nil
+		}}
+		_, err := DetectInterfaceMTU(conn, "tailscale0")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unreadable MTU")
+	})
+
+	t.Run("requires an interface name", func(t *testing.T) {
+		_, err := DetectInterfaceMTU(&funcSSHExecutor{}, "")
+		require.Error(t, err)
+	})
+}
+
+func TestWaitForInterfaceAddress(t *testing.T) {
+	t.Run("succeeds when the address is already there", func(t *testing.T) {
+		conn := &funcSSHExecutor{execFunc: func(string) (*ssh.ExecResult, error) {
+			return &ssh.ExecResult{Stdout: "tailscale0\n", ExitCode: 0}, nil
+		}}
+		require.NoError(t, WaitForInterfaceAddress(conn, "tailscale0", "100.81.89.62", 3, time.Millisecond))
+	})
+
+	t.Run("succeeds once the interface comes up", func(t *testing.T) {
+		calls := 0
+		conn := &funcSSHExecutor{execFunc: func(string) (*ssh.ExecResult, error) {
+			calls++
+			if calls < 3 {
+				return &ssh.ExecResult{Stdout: "", ExitCode: 0}, nil
+			}
+			return &ssh.ExecResult{Stdout: "tailscale0\n", ExitCode: 0}, nil
+		}}
+		require.NoError(t, WaitForInterfaceAddress(conn, "tailscale0", "100.81.89.62", 5, time.Millisecond))
+		assert.Equal(t, 3, calls)
+	})
+
+	t.Run("reports the interface when it never appears", func(t *testing.T) {
+		conn := &funcSSHExecutor{execFunc: func(string) (*ssh.ExecResult, error) {
+			return &ssh.ExecResult{Stdout: "", ExitCode: 0}, nil
+		}}
+		err := WaitForInterfaceAddress(conn, "tailscale0", "100.81.89.62", 2, time.Millisecond)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tailscale0")
+		assert.Contains(t, err.Error(), "100.81.89.62")
+	})
+
+	t.Run("fails when the address is on a different interface", func(t *testing.T) {
+		conn := &funcSSHExecutor{execFunc: func(string) (*ssh.ExecResult, error) {
+			return &ssh.ExecResult{Stdout: "enp1s0\n", ExitCode: 0}, nil
+		}}
+		err := WaitForInterfaceAddress(conn, "tailscale0", "100.81.89.62", 1, time.Millisecond)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "enp1s0")
+	})
+}
+
+func TestInterfaceAddresses(t *testing.T) {
+	conn := &funcSSHExecutor{execFunc: func(command string) (*ssh.ExecResult, error) {
+		assert.Contains(t, command, "dev enp1s0")
+		// blue1's broken state: node address plus the floating VIP.
+		return &ssh.ExecResult{Stdout: "192.168.1.185/24\n10.0.0.11/32\n", ExitCode: 0}, nil
+	}}
+	addrs, err := InterfaceAddresses(conn, "enp1s0")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.168.1.185", "10.0.0.11"}, addrs)
+}
+
+// funcSSHExecutor is a per-call mock, for tests that vary their response by
+// command or by attempt number.
+type funcSSHExecutor struct {
+	execFunc func(command string) (*ssh.ExecResult, error)
+}
+
+func (f *funcSSHExecutor) Exec(command string) (*ssh.ExecResult, error) {
+	if f.execFunc != nil {
+		return f.execFunc(command)
+	}
+	return &ssh.ExecResult{ExitCode: 0}, nil
 }

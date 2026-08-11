@@ -49,7 +49,10 @@ ClusterConfig = {
     ? domain: text,
     primary_domain: text @go_name("PrimaryDomain"),
     vip: text @go_name("VIP"),
-    ? allow_cgnat_vip: bool @go_name("AllowCGNATVIP")
+    ? allow_cgnat_vip: bool @go_name("AllowCGNATVIP"),
+    ; Which network carries Flannel's VXLAN endpoints: "lan" (default) or
+    ; "tailscale". Empty behaves as "lan".
+    ? network_substrate: text @go_name("NetworkSubstrate")
 }
 
 ; Map of component names to their configurations

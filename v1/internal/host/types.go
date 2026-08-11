@@ -51,7 +51,7 @@ type Host struct {
 	Address          string            // IP address or FQDN
 	NodeIP           string            `json:"node_ip,omitempty" yaml:"node_ip,omitempty"`                     // Physical cluster/LAN address; defaults to a non-CGNAT Address when Address is an IP
 	FlannelInterface string            `json:"flannel_interface,omitempty" yaml:"flannel_interface,omitempty"` // Physical interface used for the Flannel underlay
-	TailscaleAddress string            `json:"tailscale_address,omitempty" yaml:"tailscale_address,omitempty"` // Optional remote-management/API address; never used by Flannel
+	TailscaleAddress string            `json:"tailscale_address,omitempty" yaml:"tailscale_address,omitempty"` // Remote-management/API address; also the Flannel endpoint when cluster.network_substrate is "tailscale"
 	Port             int               // SSH port (default 22)
 	User             string            // SSH user
 	SSHKeySet        bool              // Whether an SSH key has been configured for this host

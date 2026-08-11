@@ -39,11 +39,12 @@ type DNSZone struct {
 
 // ClusterConfig represents a structured data type
 type ClusterConfig struct {
-	Name          string  `json:"name" yaml:"name"`
-	Domain        *string `json:"domain,omitempty" yaml:"domain,omitempty"`
-	PrimaryDomain string  `json:"primary_domain" yaml:"primary_domain"`
-	VIP           string  `json:"vip" yaml:"vip"`
-	AllowCGNATVIP *bool   `json:"allow_cgnat_vip,omitempty" yaml:"allow_cgnat_vip,omitempty"`
+	Name             string  `json:"name" yaml:"name"`
+	Domain           *string `json:"domain,omitempty" yaml:"domain,omitempty"`
+	PrimaryDomain    string  `json:"primary_domain" yaml:"primary_domain"`
+	VIP              string  `json:"vip" yaml:"vip"`
+	AllowCGNATVIP    *bool   `json:"allow_cgnat_vip,omitempty" yaml:"allow_cgnat_vip,omitempty"`
+	NetworkSubstrate string  `json:"network_substrate,omitempty" yaml:"network_substrate,omitempty"`
 }
 
 // ComponentMap is a type alias

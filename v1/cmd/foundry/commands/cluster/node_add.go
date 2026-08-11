@@ -289,7 +289,7 @@ func addNodeToCluster(ctx context.Context, hostname string, nodeRole *k3s.Determ
 		},
 		DisableComponents: []string{"traefik", "servicelb"},
 	}
-	if err := applyHostNetwork(targetHost, k3sConfig, cfg.Cluster.VIP); err != nil {
+	if err := applyHostNetwork(targetHost, k3sConfig, cfg); err != nil {
 		return err
 	}
 	if err := k3s.ResolveNodeNetwork(conn, k3sConfig); err != nil {

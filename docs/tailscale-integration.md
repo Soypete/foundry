@@ -20,11 +20,17 @@ See [K3s network planes](./network-planes.md) for the full model. In short:
 
 | Plane | Purpose | Carried by |
 |---|---|---|
-| Physical LAN | Node identity, Flannel VXLAN underlay | `node_ip`, `flannel_interface` |
-| Pod network | Pod-to-pod traffic | Flannel over the LAN |
+| Node underlay | Node identity, Flannel VXLAN underlay | `node_ip`, `flannel_interface` |
+| Pod network | Pod-to-pod traffic | Flannel over the node underlay |
 | Service network | ClusterIPs, including in-cluster DNS | kube-proxy |
-| API VIP | Stable API endpoint for in-cluster clients, HA failover | kube-vip, **LAN only** |
+| API VIP | Stable API endpoint for in-cluster clients, HA failover | kube-vip, **never on the tailnet** |
 | Tailscale | Remote kubectl, ingress, administration | Tailscale operator |
+
+The node underlay is the LAN by default. `cluster.network_substrate: tailscale`
+moves it to the tailnet for clusters whose nodes have no shared layer 2; see
+[K3s network planes](./network-planes.md#substrate-selection) for the trade-offs.
+This is independent of the operator, which exposes *services* and never carries
+pod-to-pod traffic in either mode.
 
 ### Why the API VIP stays internal
 
@@ -34,14 +40,19 @@ Flannel can select the VIP as the node's VXLAN endpoint — an address the other
 nodes cannot reach coherently. Cross-node pod traffic involving that node then
 fails while the remaining nodes stay healthy.
 
-Foundry guards against this at three layers, so a misconfiguration fails loudly
+Foundry guards against this at four layers, so a misconfiguration fails loudly
 rather than silently breaking the overlay:
 
+- Foundry does not deploy kube-vip at all for a single control plane, where the
+  VIP provides no failover. This removes the collision at its source: there is
+  no second address on the interface to select.
 - `Host.K3sNodeIP()` refuses to infer a node IP from a CGNAT (`100.64.0.0/10`)
   address and requires an explicit `node_ip`.
-- `ResolveNodeNetwork` refuses an empty `node_ip`, refuses `node_ip == VIP`, and
-  derives the Flannel interface from the node IP rather than the interface's
-  address list.
+- `ResolveNodeNetwork` refuses an empty `node_ip`, refuses `node_ip == VIP`,
+  derives the Flannel interface from the node IP, and then enumerates that
+  interface's addresses and refuses to converge if the VIP is among them.
+  Pinning by interface *name* alone is not enough: K3s resolves the name to
+  whichever address it picks, so the VIP must be excluded by address.
 - `ValidateFlannelPublicIPs` reads each node's
   `flannel.alpha.coreos.com/public-ip` after installation, rejects it if it
   equals the VIP or differs from the configured node IP, and verifies another

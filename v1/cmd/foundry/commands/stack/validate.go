@@ -42,6 +42,7 @@ func runStackValidate(ctx context.Context, cmd *cli.Command) error {
 		{"Configuration structure", validateConfigStructure},
 		{"Secret references syntax", validateSecretReferences},
 		{"Network configuration", validateNetworkConfig},
+		{"Network substrate", validateNetworkSubstrate},
 		{"DNS configuration", validateDNSConfig},
 		{"VIP configuration", validateVIPConfig},
 		{"Cluster configuration", validateClusterConfig},
@@ -145,6 +146,21 @@ func validateDNSConfig(cfg *config.Config) error {
 		}
 	}
 
+	return nil
+}
+
+// validateNetworkSubstrate checks that the configured substrate exists and that
+// every cluster host can serve as a node on it.
+func validateNetworkSubstrate(cfg *config.Config) error {
+	substrate, err := network.NewSubstrate(cfg.Cluster.NetworkSubstrate)
+	if err != nil {
+		return err
+	}
+	for _, h := range cfg.GetClusterHosts() {
+		if err := substrate.Validate(h, cfg.Cluster.VIP); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

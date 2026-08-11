@@ -15,6 +15,9 @@ Config = {
     interface: text @go_name("Interface"),
     node_ip: text @go_name("NodeIP"),
     flannel_iface: text @go_name("FlannelIface"),
+    ; Pod MTU. Zero lets Flannel derive it, which is correct on a LAN and wrong
+    ; on tailscale0.
+    ? flannel_mtu: int @go_name("FlannelMTU"),
     advertise_address: text @go_name("AdvertiseAddress"),
     cluster_token: text @go_name("ClusterToken"),
     agent_token: text @go_name("AgentToken"),
