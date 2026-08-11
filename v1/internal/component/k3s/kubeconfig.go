@@ -20,12 +20,19 @@ type KubeconfigClient interface {
 // data plane and is deliberately not routable on the tailnet, so a kubeconfig
 // pointing at it only works from the LAN. The Tailscale address is added to the
 // API certificate SANs during provisioning, so it is a valid endpoint.
-// Falls back to the VIP when the host has no Tailscale address.
-func ClientEndpoint(tailscaleAddress, vip string) string {
+//
+// Falls back to the VIP, and then to the node's own address. The last fallback
+// matters for a single control plane cluster, where no VIP is deployed because
+// a floating address with nothing to float between provides no failover: the
+// node address is then the only endpoint there is.
+func ClientEndpoint(tailscaleAddress, vip, nodeIP string) string {
 	if tailscaleAddress != "" {
 		return tailscaleAddress
 	}
-	return vip
+	if vip != "" {
+		return vip
+	}
+	return nodeIP
 }
 
 // RetrieveKubeconfig retrieves the kubeconfig from a K3s control plane node

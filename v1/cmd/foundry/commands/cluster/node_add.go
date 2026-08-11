@@ -65,8 +65,8 @@ func runNodeAdd(ctx context.Context, cmd *cli.Command) error {
 	if cfg.Cluster.Name == "" {
 		return fmt.Errorf("cluster configuration not found")
 	}
-	if cfg.Network == nil || cfg.Cluster.VIP == "" {
-		return fmt.Errorf("network configuration with k8s_vip required")
+	if cfg.Network == nil {
+		return fmt.Errorf("network configuration required")
 	}
 
 	// Get host from registry
@@ -266,20 +266,32 @@ func addNodeToCluster(ctx context.Context, hostname string, nodeRole *k3s.Determ
 	if targetHost == nil {
 		return fmt.Errorf("host %s is not present in configuration", hostname)
 	}
-	serverURL := fmt.Sprintf("https://%s:6443", cfg.Cluster.VIP)
+	// Joins address the API over the cluster's own endpoint, which is the VIP
+	// only when one is deployed. With a single control plane it is that node's
+	// address; using cfg.Cluster.VIP unconditionally here produced
+	// "https://:6443" for a VIP-less cluster.
+	joinEndpoint, err := cfg.APIEndpoint()
+	if err != nil {
+		return fmt.Errorf("cannot determine the API endpoint to join: %w", err)
+	}
+	if joinEndpoint == "" {
+		return fmt.Errorf("cannot determine the API endpoint to join: no control plane host is configured")
+	}
+	serverURL := fmt.Sprintf("https://%s:6443", joinEndpoint)
 	k3sConfig := &k3s.Config{
 		ClusterInit:  false,
 		ServerURL:    serverURL,
 		ClusterToken: tokens.ClusterToken,
 		AgentToken:   tokens.AgentToken,
-		VIP:          cfg.Cluster.VIP,
+		VIP:          deployedVIP(cfg),
 		TLSSANs: []string{
-			cfg.Cluster.VIP,
 			fmt.Sprintf("%s.%s", cfg.Cluster.Name, cfg.Cluster.PrimaryDomain),
 		},
 		DisableComponents: []string{"traefik", "servicelb"},
 	}
-	applyHostNetwork(targetHost, k3sConfig)
+	if err := applyHostNetwork(targetHost, k3sConfig, cfg.Cluster.VIP); err != nil {
+		return err
+	}
 	if err := k3s.ResolveNodeNetwork(conn, k3sConfig); err != nil {
 		return fmt.Errorf("failed to resolve node network: %w", err)
 	}

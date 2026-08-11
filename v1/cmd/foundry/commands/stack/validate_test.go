@@ -22,7 +22,10 @@ func setupValidateTestRegistry(t *testing.T) {
 	component.DefaultRegistry.Register(&mockComponent{name: "zot", dependencies: []string{"dns", "openbao"}})
 	component.DefaultRegistry.Register(&mockComponent{name: "k3s", dependencies: []string{"openbao", "dns", "zot"}})
 	component.DefaultRegistry.Register(&mockComponent{name: "contour", dependencies: []string{"k3s"}})
-	component.DefaultRegistry.Register(&mockComponent{name: "certmanager", dependencies: []string{"k3s"}})
+	// Must match certmanager.Component.Name(); a mock under a different name
+	// would let validateComponentDependencies pass here while failing against
+	// the real registry.
+	component.DefaultRegistry.Register(&mockComponent{name: "cert-manager", dependencies: []string{"k3s"}})
 }
 
 // TestValidateConfigStructure tests basic config structure validation
@@ -273,7 +276,10 @@ func TestValidateNetworkConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "IP not on same network",
+			// Subnet membership is no longer the test: an address on another
+			// network is still exclusively this host's own. See
+			// network.ValidateFlannelEndpoints.
+			name: "IP not on same network is accepted",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -287,8 +293,7 @@ func TestValidateNetworkConfig(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
-			errMsg:  "not in network",
+			wantErr: false,
 		},
 		{
 			name: "DHCP conflict",
@@ -460,12 +465,28 @@ func TestValidateVIPConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "missing VIP",
+			// One control plane host needs no VIP: a floating address with
+			// nothing to float between provides no failover.
+			name: "missing VIP is allowed for a single control plane",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{},
+				Hosts: []*host.Host{
+					{Hostname: "blue1", Address: "192.168.1.185", Roles: []string{host.RoleClusterControlPlane}},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "missing VIP is rejected for multiple control planes",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{},
+				Hosts: []*host.Host{
+					{Hostname: "blue1", Address: "192.168.1.185", Roles: []string{host.RoleClusterControlPlane}},
+					{Hostname: "blue2", Address: "192.168.1.97", Roles: []string{host.RoleClusterControlPlane}},
+				},
 			},
 			wantErr: true,
-			errMsg:  "vip is required",
+			errMsg:  "cluster.vip is required for a multi-control-plane cluster",
 		},
 		{
 			name: "nil network config",
@@ -700,9 +721,10 @@ func TestRunStackValidate_Integration(t *testing.T) {
 			},
 		}
 
-		// Should fail on network validation (VIP not on same network)
+		// Network validation passes: an off-LAN VIP is legitimate (kube-vip
+		// carries it as a /32) and the host's address is on the LAN.
 		err := validateNetworkConfig(invalidCfg)
-		assert.Error(t, err)
+		assert.NoError(t, err)
 
 		// Should fail on DNS validation (no infrastructure zones)
 		err = validateDNSConfig(invalidCfg)
@@ -817,7 +839,11 @@ func TestValidateTailscaleConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "error - tailscale enabled but missing credentials",
+			// Credentials absent from stack.yaml is valid: OpenBAO is the
+			// authoritative store and may already hold them. It is reported as
+			// an advisory warning instead -- see
+			// TestWarnMissingTailscaleCredentials.
+			name: "valid - tailscale enabled with credentials only in OpenBAO",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -846,8 +872,7 @@ func TestValidateTailscaleConfig(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
-			errMsg:  "Tailscale is enabled but OAuth credentials are missing",
+			wantErr: false,
 		},
 		{
 			name: "valid - tailscale disabled",

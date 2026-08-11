@@ -91,12 +91,14 @@ func TestKubeconfigClientEndpoint(t *testing.T) {
 			want: "",
 		},
 		{
-			name: "empty when neither tailscale address nor VIP configured",
+			// A single control plane cluster has no VIP, so the node's own
+			// address is the endpoint; it is the only one there is.
+			name: "falls back to the node address when no tailscale address or VIP",
 			cfg: &config.Config{
 				Cluster: config.ClusterConfig{VIP: ""},
 				Hosts:   []*host.Host{cpHost("blue1", endpointLAN, "")},
 			},
-			want: "",
+			want: endpointLAN,
 		},
 		{
 			name: "nil config is handled",

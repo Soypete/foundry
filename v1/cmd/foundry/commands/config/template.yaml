@@ -69,20 +69,29 @@ components:
     version: latest
 
   # tailscale:
-  #   # Tailscale Kubernetes Operator configuration
-  #   # Requires OAuth credentials from https://tailscale.com/docs/kubernetes-operator/quickstart#create-oauth-credentials-and-configure-secrets
-  #   enabled: true
-  #   # OAuth client ID and secret - can be literal values or ${secret:foundry-core/tailscale:client_id}
-  #   oauth_client_id: ${secret:foundry-core/tailscale:client_id}
-  #   oauth_client_secret: ${secret:foundry-core/tailscale:client_secret}
-  #   # Optional: override the operator image
-  #   # operator_image: tailscale/operator:v1.4.0
-  #   # Optional: ACL tags for operator-managed nodes (default: ["tag:k8s-foundry"])
+  #   # Tailscale Kubernetes Operator - exposes selected services on your tailnet.
+  #   # It does NOT put the cluster's nodes or pods on Tailscale. See
+  #   # docs/tailscale-integration.md.
+  #   #
+  #   # Requires an OAuth client with the devices:write and auth_keys scopes:
+  #   # https://tailscale.com/kb/1236/kubernetes-operator#prerequisites
+  #   #
+  #   # Credentials live in OpenBAO at foundry-core/tailscale. Literal values set
+  #   # here are stored there on first install and this file is rewritten to
+  #   # reference them, so plaintext does not persist.
+  #   oauth_client_id: ${secret:tailscale:client_id}
+  #   oauth_client_secret: ${secret:tailscale:client_secret}
+  #   # Optional: pin the operator image
+  #   # operator_image: tailscale/operator:v1.98.9
+  #   # Optional: ACL tags for operator-managed devices (default: ["tag:k8s-foundry"])
   #   # tags:
   #   #   - tag:k8s-foundry
-  #   # Optional: additional subnet routes to advertise
+  #   # Optional: subnet routes to advertise on the tailnet.
+  #   # Only for reaching a non-cluster network through the cluster. NEVER list
+  #   # pod, Service, or API VIP ranges here - those stay internal to the cluster.
+  #   # With no routes set, no Connector is created, which is the right default.
   #   # advertise_routes:
-  #   #   - 10.0.0.0/24
+  #   #   - 172.16.5.0/24
 
   # grafana:
   #   # Grafana alerting, passed through to Grafana's native file-based provisioning

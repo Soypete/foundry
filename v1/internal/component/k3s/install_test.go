@@ -656,3 +656,89 @@ func TestUpdateK3sConfigRefusesNodeIPChange(t *testing.T) {
 	assert.False(t, wroteNetwork)
 	assert.False(t, restarted)
 }
+
+// TestInstallControlPlaneSkipsKubeVIPWithoutVIP guards the property that makes
+// a single control plane cluster converge: with no VIP to deploy, nothing
+// applies kube-vip manifests and nothing waits for a floating address.
+func TestInstallControlPlaneSkipsKubeVIPWithoutVIP(t *testing.T) {
+	var commands []string
+	executor := &mockInstallSSHExecutor{
+		execFunc: func(command string) (*ssh.ExecResult, error) {
+			commands = append(commands, command)
+			switch {
+			// Report no existing installation so the fresh-install path runs.
+			case strings.Contains(command, "systemctl is-active"):
+				return &ssh.ExecResult{Stdout: "inactive", ExitCode: 3}, nil
+			// kube-vip is not deployed here.
+			case strings.Contains(command, "get daemonset"):
+				return &ssh.ExecResult{ExitCode: 1}, nil
+			case strings.Contains(command, "kubectl get nodes"):
+				return &ssh.ExecResult{Stdout: "Ready", ExitCode: 0}, nil
+			}
+			return &ssh.ExecResult{ExitCode: 0}, nil
+		},
+	}
+
+	cfg := &Config{
+		ClusterInit:  true,
+		ClusterToken: "token",
+		NodeIP:       "192.168.1.185",
+		FlannelIface: "enp1s0",
+	}
+	require.NoError(t, InstallControlPlane(context.Background(), executor, cfg))
+
+	joined := strings.Join(commands, "\n")
+	// Querying whether kube-vip exists is fine; applying it is not.
+	assert.NotContains(t, joined, "kubectl apply",
+		"no kube-vip manifests may be applied when no VIP is deployed")
+	assert.NotContains(t, joined, "ip addr show",
+		"nothing should wait for a VIP that was never deployed")
+	assert.NotContains(t, joined, "ip route show default",
+		"the kube-vip interface detection that pairs it to the Flannel NIC must not run")
+}
+
+// TestInstallControlPlaneReportsButDoesNotDeleteStaleKubeVIP is the guard on
+// install staying non-destructive: it may report a kube-vip it no longer
+// manages, but removing it belongs to `foundry stack doctor --fix`.
+func TestInstallControlPlaneReportsButDoesNotDeleteStaleKubeVIP(t *testing.T) {
+	var commands []string
+	executor := &mockInstallSSHExecutor{
+		execFunc: func(command string) (*ssh.ExecResult, error) {
+			commands = append(commands, command)
+			switch {
+			case strings.Contains(command, "systemctl is-active"):
+				return &ssh.ExecResult{Stdout: "inactive", ExitCode: 3}, nil
+			// kube-vip IS deployed, left over from an earlier install.
+			case strings.Contains(command, "get daemonset"):
+				return &ssh.ExecResult{Stdout: "kube-vip", ExitCode: 0}, nil
+			case strings.Contains(command, "kubectl get nodes"):
+				return &ssh.ExecResult{Stdout: "Ready", ExitCode: 0}, nil
+			}
+			return &ssh.ExecResult{ExitCode: 0}, nil
+		},
+	}
+
+	cfg := &Config{
+		ClusterInit:  true,
+		ClusterToken: "token",
+		NodeIP:       "192.168.1.185",
+		FlannelIface: "enp1s0",
+	}
+	require.NoError(t, InstallControlPlane(context.Background(), executor, cfg))
+
+	joined := strings.Join(commands, "\n")
+	assert.NotContains(t, joined, "delete",
+		"install must never delete kube-vip; that is stack doctor --fix's job")
+}
+
+func TestStaleKubeVIPNotice(t *testing.T) {
+	notice := StaleKubeVIPNotice("10.0.0.11", "enp1s0")
+	assert.Contains(t, notice, "10.0.0.11")
+	assert.Contains(t, notice, "enp1s0")
+	assert.Contains(t, notice, "kubectl delete daemonset")
+
+	// Stays readable once the VIP has been dropped from stack.yaml.
+	bare := StaleKubeVIPNotice("", "")
+	assert.Contains(t, bare, "the API VIP")
+	assert.NotContains(t, bare, "  ''")
+}

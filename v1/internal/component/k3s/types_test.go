@@ -170,12 +170,13 @@ func TestConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "missing VIP",
+			// A single control plane cluster deploys no kube-vip, so an empty
+			// VIP is a valid configuration rather than a missing field.
+			name: "missing VIP is allowed",
 			config: &Config{
 				ClusterInit: true,
 			},
-			wantErr: true,
-			errMsg:  "VIP is required",
+			wantErr: false,
 		},
 		{
 			name: "invalid VIP format",
@@ -212,7 +213,7 @@ func TestConfig_Validate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.config.Validate()
 			if tt.wantErr {
-				assert.Error(t, err)
+				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errMsg)
 			} else {
 				assert.NoError(t, err)

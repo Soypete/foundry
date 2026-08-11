@@ -1,243 +1,280 @@
-# Using Foundry with Tailscale Networks
+# Tailscale Integration
 
-This guide covers deploying Foundry clusters on Tailscale overlay networks using CGNAT IP addresses (RFC 6598 Shared Address Space, 100.64.0.0/10).
+Foundry uses Tailscale for **external access to the cluster** — remote `kubectl`,
+ingress, and administration — while all internal cluster traffic stays on the
+physical LAN.
 
-## Overview
+Treat the cluster as though there is no LAN to reach it from: everything coming
+from outside arrives over the tailnet.
 
-Tailscale uses the CGNAT IP range (100.64.0.0/10) for its overlay network, which is outside the traditional RFC 1918 private IP ranges. By default, Foundry's VIP validation only accepts RFC 1918 addresses. The `allow_cgnat_vip` configuration flag enables support for Tailscale and similar overlay networks.
+## The rule
 
-## Prerequisites
+**Cluster-internal networks never go on the tailnet.**
 
-- Tailscale installed and configured on all cluster nodes
-- Nodes tagged appropriately (e.g., `tag:k8s`)
-- Tailscale ACL configured to allow inter-node communication
+Pod addresses, Service ClusterIPs, and the API VIP are internal to the cluster
+data plane. Advertising any of them as a Tailscale subnet route puts cluster
+traffic on the overlay, which is the failure mode this integration exists to
+avoid. Foundry will not do it, and you should not configure it by hand.
 
-## Required Tailscale ACL Configuration
+See [K3s network planes](./network-planes.md) for the full model. In short:
 
-Your Tailscale ACL must allow:
-1. **Your local machine → cluster nodes** (for Foundry SSH access)
-2. **Cluster nodes → cluster nodes** (for K3s cluster formation)
+| Plane | Purpose | Carried by |
+|---|---|---|
+| Physical LAN | Node identity, Flannel VXLAN underlay | `node_ip`, `flannel_interface` |
+| Pod network | Pod-to-pod traffic | Flannel over the LAN |
+| Service network | ClusterIPs, including in-cluster DNS | kube-proxy |
+| API VIP | Stable API endpoint for in-cluster clients, HA failover | kube-vip, **LAN only** |
+| Tailscale | Remote kubectl, ingress, administration | Tailscale operator |
 
-### Example ACL
+### Why the API VIP stays internal
 
-```json
-{
-  "acls": [
-    {
-      "action": "accept",
-      "src": ["*"],
-      "dst": ["*:*"]
-    }
-  ],
-  "ssh": [
-    {
-      "action": "accept",
-      "src": ["autogroup:members"],
-      "dst": ["tag:k8s"],
-      "users": ["root", "ubuntu"]
-    },
-    {
-      "action": "accept",
-      "src": ["tag:k8s"],
-      "dst": ["tag:k8s"],
-      "users": ["root"]
-    }
-  ],
-  "tagOwners": {
-    "tag:k8s": ["autogroup:admin"]
-  }
-}
-```
+kube-vip assigns the VIP as a secondary address on a node's LAN interface. If
+that node's K3s configuration does not pin `node_ip` and `flannel_interface`,
+Flannel can select the VIP as the node's VXLAN endpoint — an address the other
+nodes cannot reach coherently. Cross-node pod traffic involving that node then
+fails while the remaining nodes stay healthy.
 
-**Critical:** The second SSH rule (`tag:k8s` → `tag:k8s`) allows cluster nodes to SSH to each other, which is required for K3s agent installation on worker nodes.
+Foundry guards against this at three layers, so a misconfiguration fails loudly
+rather than silently breaking the overlay:
 
-## Configuration
+- `Host.K3sNodeIP()` refuses to infer a node IP from a CGNAT (`100.64.0.0/10`)
+  address and requires an explicit `node_ip`.
+- `ResolveNodeNetwork` refuses an empty `node_ip`, refuses `node_ip == VIP`, and
+  derives the Flannel interface from the node IP rather than the interface's
+  address list.
+- `ValidateFlannelPublicIPs` reads each node's
+  `flannel.alpha.coreos.com/public-ip` after installation, rejects it if it
+  equals the VIP or differs from the configured node IP, and verifies another
+  node can reach it.
 
-### Single Control Plane Setup
+## Host configuration
 
-See `validateK8sVIPUniqueness()` in v1/internal/config/types.go and "Understanding VIP Routing on Tailscale" below for details.
-
-For Tailscale deployments, use a CGNAT IP in the 100.64.0.0/10 range that:
-- Is NOT assigned to any of your cluster nodes
-- Is within your Tailscale network's IP range
-- Will be advertised as a subnet route by the Tailscale operator
+Each cluster host carries three distinct addresses. They are not
+interchangeable.
 
 ```yaml
-cluster:
-  name: my-cluster
-  primary_domain: example.local
-  vip: 100.81.89.100  # Dedicated VIP (not assigned to any host)
-  allow_cgnat_vip: true
-
 hosts:
-  - hostname: control-plane
-    address: 100.81.89.62  # Control plane's Tailscale IP
-    user: root
-  - hostname: worker-1
-    address: 100.70.90.12
-    user: root
-  - hostname: worker-2
-    address: 100.125.196.1
-    user: root
+  - hostname: blue1
+    address: 192.168.1.185          # SSH/management address Foundry connects to
+    node_ip: 192.168.1.185          # LAN address K3s and Flannel use
+    flannel_interface: enp1s0       # interface that owns node_ip
+    tailscale_address: 100.81.89.62 # tailnet address for remote access
+    roles: [cluster-control-plane]
+
+  - hostname: blue2
+    address: 192.168.1.97
+    node_ip: 192.168.1.97
+    flannel_interface: enp1s0
+    tailscale_address: 100.125.196.1
+    roles: [cluster-worker]
+
+cluster:
+  vip: 10.0.0.11                    # internal only; never advertised on Tailscale
 ```
 
-**Important:** The VIP must be different from any host's IP address. You must advertise the VIP as a subnet route from the control plane:
+`tailscale_address` is used for two things and nothing else:
+
+1. It is added to the API server's TLS SANs, so a remote client can present it.
+2. It becomes the server URL in the generated kubeconfig.
+
+It is never used as a node address, an advertise address, or a Flannel endpoint.
+
+## Remote kubectl
+
+With `tailscale_address` set on a control plane host, Foundry points the
+kubeconfig at it:
+
+```
+server: https://100.81.89.62:6443
+```
+
+Without one, the kubeconfig falls back to the API VIP, which is only reachable
+from the cluster LAN. `foundry stack validate` warns when a control plane host
+has no `tailscale_address`.
+
+### Repairing an existing cluster
+
+Adding `tailscale_address` to `stack.yaml` does not by itself update a
+kubeconfig that was generated earlier. Converge it:
 
 ```bash
-# On the control plane node
-tailscale up --advertise-routes=100.81.89.100/32
+foundry component install k3s --all-nodes
 ```
 
-Then approve the route in the Tailscale admin console.
-
-### High Availability (Multi-Control-Plane) Setup
-
-For HA setups with multiple control planes, you need to make the VIP routable via Tailscale:
-
-#### Option 1: Tailscale Subnet Routes
-
-Advertise the VIP as a subnet route from the active control plane:
+This re-points the stored kubeconfig and exports it to `~/.foundry/kubeconfig`.
+It is idempotent — a kubeconfig already using the right endpoint is reported
+unchanged. Verify:
 
 ```bash
-# On the control plane node
-tailscale up --advertise-routes=100.81.89.100/32
+grep server: ~/.foundry/kubeconfig
+kubectl --kubeconfig ~/.foundry/kubeconfig get nodes
 ```
 
-Then approve the route in the Tailscale admin console.
+## The Tailscale operator
+
+The operator exposes selected services on the tailnet. It runs as a pod; it does
+**not** put the cluster's nodes or pods on Tailscale.
+
+### Prerequisites
+
+An OAuth client with the `devices:write` and `auth_keys` scopes. See the
+[Tailscale Kubernetes operator documentation](https://tailscale.com/kb/1236/kubernetes-operator#prerequisites).
+
+Foundry requires OpenBAO and K3s to be installed first.
+
+### Configuration
 
 ```yaml
-cluster:
-  name: my-cluster
-  primary_domain: example.local
-  vip: 100.81.89.100  # Dedicated VIP
-  allow_cgnat_vip: true
+components:
+  tailscale:
+    # Literal values are written to OpenBAO on first install, and this file is
+    # rewritten to reference them so plaintext does not persist here.
+    oauth_client_id: ${secret:tailscale:client_id}
+    oauth_client_secret: ${secret:tailscale:client_secret}
+
+    # Optional: pin the operator image.
+    # operator_image: tailscale/operator:v1.98.9
+
+    # Optional: ACL tags for operator-managed devices.
+    # Defaults to [tag:k8s-foundry].
+    # tags:
+    #   - tag:k8s-foundry
+
+    # Optional: subnet routes to advertise on the tailnet.
+    #
+    # Only set this to reach a non-cluster network through the cluster. Never
+    # list pod, Service, or VIP ranges here. With no routes configured, no
+    # Connector is created at all -- which is the correct default.
+    # advertise_routes:
+    #   - 172.16.5.0/24
 ```
 
-**Note:** kube-vip will manage the VIP assignment, but you need to ensure the route is advertised from whichever node currently holds the VIP.
+Credentials are stored in OpenBAO at `foundry-core/tailscale` with keys
+`client_id` and `client_secret`. If they are absent from both the config and
+OpenBAO, installation fails with a link to the documentation above.
 
-#### Option 2: Tailscale Operator (Recommended for HA)
+### Installing
 
-The Tailscale Operator integration will be available in a future Foundry release. This will provide:
-- Automatic operator installation on control planes
-- Automated VIP subnet route management
-- Support for cross-pod network policies via Tailscale ACLs
+```bash
+foundry component install tailscale
+```
 
-For now, use Option 1 (Subnet Routes) for HA setups.
+Idempotent, and it converges onto an operator that was installed outside
+Foundry rather than failing on the existing Helm release.
 
-## Network Routing Considerations
+### Checking state
 
-### Understanding VIP Routing on Tailscale
+```bash
+foundry component tailscale health
+```
 
-Traditional kube-vip assumes Layer 2 networking where the VIP can "float" between nodes via ARP announcements. Tailscale is a Layer 3 overlay network where:
+```
+Tailscale integration
 
-- **IPs are routed, not bridged** - Nodes communicate via Tailscale's WireGuard tunnels
-- **No ARP** - IP routing is managed by Tailscale's coordination server
-- **Explicit routes required** - Any IP that isn't a node's primary Tailscale IP needs to be advertised as a subnet route
+  Operator:  deployed
+  Address:   operator.tail-scale.ts.net
 
-### VIP Reachability
+  Ingress:
+    ✓ kei/kei-web                              kei-web.tail-scale.ts.net
+    ✗ kei/kei-oidc                             no address assigned
+```
 
-For worker nodes to reach the VIP:
+Exits non-zero when the operator is not deployed or an ingress is not serving,
+so it can be used as a check. An ingress with no assigned address means the
+operator has not finished provisioning its proxy, or the proxy is failing.
 
-**Single control plane:**
-- VIP = control plane IP → Always routable (it's the node's primary IP)
+### Exposing a service
 
-**Multiple control planes:**
-- VIP = dedicated IP → Must be advertised as subnet route
-- Route must be updated when VIP moves between control planes
-- Tailscale operator can automate this
+Set the ingress class to `tailscale`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: my-app
+      port:
+        number: 80
+```
+
+The operator provisions a proxy and publishes its tailnet hostname on the
+ingress status, which is what `tailscale health` reports.
 
 ## Troubleshooting
 
-### Workers Can't Join Cluster
+### Remote kubectl times out
 
-**Symptom:**
-```
-Failed to validate connection to cluster at https://100.81.89.100:6443:
-failed to get CA certs: context deadline exceeded
-```
-
-**Diagnosis:**
-Worker nodes cannot reach the VIP. Check:
+Check what the kubeconfig points at:
 
 ```bash
-# On a worker node
-curl -k https://<VIP>:6443/version --max-time 5
-
-# If it times out, the VIP is not routable
+grep server: ~/.foundry/kubeconfig
 ```
 
-**Solution:**
-- Single control plane: Advertise VIP as subnet route from control plane
-- Multi control plane: Advertise VIP as subnet route from active control plane
+A `192.168.x` or VIP address means the endpoint was never converged — set
+`tailscale_address` and run `foundry component install k3s --all-nodes`.
 
-### SSH Connection Refused Between Nodes
+### Cross-node pod traffic fails for one node
 
-**Symptom:**
-```
-tailscale: tailnet policy does not permit you to SSH to this node
-```
+Compare each node's Flannel endpoint against its configured LAN address:
 
-**Diagnosis:**
-Tailscale ACL doesn't allow SSH between cluster nodes.
-
-**Solution:**
-Add SSH rule allowing `tag:k8s` → `tag:k8s` as shown in the ACL example above.
-
-### VIP Assigned But Not Reachable
-
-**Symptom:**
-- `ip addr show` on control plane shows VIP assigned
-- Workers still can't reach it
-
-**Diagnosis:**
-VIP is assigned to the local interface but not advertised to Tailscale.
-
-**Solution:**
 ```bash
-# On control plane
-tailscale up --advertise-routes=<VIP>/32
-
-# Then approve in Tailscale admin console
+kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,\
+FLANNEL:.metadata.annotations.flannel\\.alpha\\.coreos\\.com/public-ip
 ```
 
-## Validation Checklist
+Every value must be that node's `node_ip`. A node advertising the VIP or a
+`100.x` address has lost its network identity; add `node_ip` and
+`flannel_interface` to `stack.yaml` and run
+`foundry component install k3s --all-nodes`.
 
-Before deploying:
+### An ingress shows no address
 
-- [ ] All nodes have Tailscale installed and connected
-- [ ] Nodes are tagged appropriately (e.g., `tag:k8s`)
-- [ ] Tailscale ACL allows SSH from your machine to nodes
-- [ ] Tailscale ACL allows SSH between nodes (`tag:k8s` → `tag:k8s`)
-- [ ] For HA setups: VIP subnet route is configured and approved
-- [ ] `allow_cgnat_vip: true` is set in cluster config
-- [ ] Workers can reach the VIP: `curl -k https://<VIP>:6443/version`
+The operator has not provisioned its proxy. Check the operator's own logs and
+the proxy pods in the `tailscale` namespace, and confirm the OAuth client still
+has the required scopes and its ACL tags are authorized.
 
-## Roadmap
+### Worker nodes cannot join
 
-Future enhancements planned for Tailscale integration:
+Node joins use the LAN, not Tailscale. Confirm `node_ip` is set for every host
+and that the nodes can reach each other on the LAN. A join failure against a
+`100.x` address means an address was configured in the wrong plane.
 
-1. **Tailscale Operator Integration**
-   - Automatic operator installation on control planes
-   - Automated VIP subnet route management
-   - Support for cross-pod network policies via Tailscale ACLs
+## Migrating from a VIP-on-Tailscale setup
 
-2. **Multi-Cluster Mesh**
-   - Connect multiple Foundry clusters via Tailscale
-   - Cross-cluster service discovery
-   - Unified network policy across clusters
+Earlier guidance advertised the API VIP as a Tailscale subnet route and used
+`100.x` node addresses with `allow_cgnat_vip: true`. That puts cluster traffic
+on the overlay and can break Flannel. Foundry no longer generates that topology,
+and the guards described above now reject the node-addressing part of it.
 
-3. **GitOps for Tailscale ACLs**
-   - Version control for network policies
-   - CI/CD automation for ACL updates
-   - Integration with Foundry stack management
+To migrate:
+
+1. Give every cluster host an explicit `node_ip` (its LAN address) and
+   `flannel_interface`.
+2. Move each host's `100.x` address from `address`/`node_ip` to
+   `tailscale_address`.
+3. Withdraw any VIP subnet route advertisement
+   (`tailscale up --advertise-routes=` without the VIP) and remove the
+   corresponding route approval in the Tailscale admin console.
+4. Run `foundry component install k3s --all-nodes`.
+5. Confirm every node's Flannel public IP equals its `node_ip`, then test
+   cross-node pod traffic and remote kubectl.
+
+`allow_cgnat_vip` remains a supported flag: it relaxes VIP *format* validation
+so a `100.64.0.0/10` address is accepted. It is only needed when the VIP itself
+is a CGNAT address, which the topology above avoids. A VIP on the LAN does not
+need it.
+
+Back up the K3s datastore before step 4. If a node loses connectivity, restore
+that node's previous configuration and revalidate before continuing to the next.
 
 ## References
 
-- [RFC 6598 - Shared Address Space (CGNAT)](https://www.rfc-editor.org/rfc/rfc6598)
-- [Tailscale ACL Documentation](https://tailscale.com/kb/1018/acls/)
-- [Tailscale Subnet Routes](https://tailscale.com/kb/1019/subnets/)
-- [kube-vip Documentation](https://kube-vip.io/)
-
-## Contributing
-
-Found an issue or have suggestions for Tailscale integration? Please open an issue on the [Foundry GitHub repository](https://github.com/catalystcommunity/foundry).
+- [K3s network planes](./network-planes.md)
+- [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator)
+- [Tailscale subnet routers](https://tailscale.com/kb/1019/subnets)
+- [RFC 6598 — Shared Address Space (CGNAT)](https://www.rfc-editor.org/rfc/rfc6598)

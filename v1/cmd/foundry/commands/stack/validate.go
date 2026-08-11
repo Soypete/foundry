@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/network"
 	"github.com/urfave/cli/v3"
@@ -156,9 +157,12 @@ func validateVIPConfig(cfg *config.Config) error {
 	// VIP is already validated in Network.Validate() and validateK8sVIPUniqueness()
 	// but we can add additional checks here
 
-	// Ensure VIP is set
-	if cfg.Cluster.VIP == "" {
-		return fmt.Errorf("cluster.vip is required")
+	// A VIP is a floating address kube-vip moves between control plane nodes, so
+	// it is only required when there is more than one of them. A single control
+	// plane needs none: see config.VIPEnabled.
+	if cfg.Cluster.VIP == "" && len(cfg.GetClusterControlPlaneHosts()) > 1 {
+		return fmt.Errorf("cluster.vip is required for a multi-control-plane cluster: %d control plane hosts need a floating API endpoint",
+			len(cfg.GetClusterControlPlaneHosts()))
 	}
 
 	return nil
@@ -186,14 +190,15 @@ func validateClusterConfig(cfg *config.Config) error {
 
 // validateComponentDependencies validates component dependencies can be resolved
 func validateComponentDependencies(cfg *config.Config) error {
-	// Get the installation order to verify dependencies can be resolved
+	// Names must match what each component reports from Name(), which is how
+	// the registry keys them — "cert-manager", not "certmanager".
 	componentNames := []string{
 		"openbao",
 		"dns",
 		"zot",
 		"k3s",
 		"contour",
-		"certmanager",
+		"cert-manager",
 	}
 
 	order, err := component.ResolveInstallationOrder(component.DefaultRegistry, componentNames)
@@ -201,10 +206,23 @@ func validateComponentDependencies(cfg *config.Config) error {
 		return fmt.Errorf("dependency resolution failed: %w", err)
 	}
 
-	// Verify we got all components in the order
-	if len(order) != len(componentNames) {
-		return fmt.Errorf("dependency resolution incomplete: expected %d components, got %d",
-			len(componentNames), len(order))
+	// Verify every requested component made it into the order. The result may
+	// legitimately be longer than the request — resolution pulls in transitive
+	// dependencies, e.g. contour brings in gateway-api — so compare membership
+	// rather than length.
+	resolved := make(map[string]bool, len(order))
+	for _, name := range order {
+		resolved[name] = true
+	}
+	var missing []string
+	for _, name := range componentNames {
+		if !resolved[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("dependency resolution incomplete: missing %s",
+			strings.Join(missing, ", "))
 	}
 
 	return nil
@@ -216,7 +234,23 @@ func validateComponentDependencies(cfg *config.Config) error {
 func collectConfigWarnings(cfg *config.Config) []string {
 	var warnings []string
 	warnings = append(warnings, warnMissingControlPlaneTailscaleAddress(cfg)...)
+	warnings = append(warnings, warnMissingTailscaleCredentials(cfg)...)
+	warnings = append(warnings, warnUndeployedVIP(cfg)...)
 	return warnings
+}
+
+// warnUndeployedVIP reports a cluster.vip that Foundry will not deploy because
+// the cluster has a single control plane host.
+func warnUndeployedVIP(cfg *config.Config) []string {
+	if cfg == nil || cfg.Cluster.VIP == "" || cfg.VIPEnabled() {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"cluster.vip %s is set but this cluster has one control plane host. Foundry will not "+
+			"deploy kube-vip for it: a single-node VIP adds no failover, and it can be selected "+
+			"as the Flannel VXLAN endpoint. Remove cluster.vip, or add a second "+
+			"cluster-control-plane host. It is still added to the API certificate SANs.",
+		cfg.Cluster.VIP)}
 }
 
 // warnMissingControlPlaneTailscaleAddress flags control plane hosts with no
@@ -272,13 +306,36 @@ func validateTailscaleConfig(cfg *config.Config) error {
 		return nil
 	}
 
-	// Tailscale is enabled - check for OAuth credentials
-	clientID, hasClientID := tsCfg.Config["oauth_client_id"].(string)
-	clientSecret, hasClientSecret := tsCfg.Config["oauth_client_secret"].(string)
+	// Credentials may legitimately be absent from this file: OpenBAO is the
+	// authoritative store, and a config that never carried them literally is
+	// valid. Whether they actually resolve is decided at install time, which is
+	// the only place with an OpenBAO client. Surface it as advice instead.
+	return nil
+}
 
-	if !hasClientID || !hasClientSecret || clientID == "" || clientSecret == "" {
-		return fmt.Errorf("Tailscale is enabled but OAuth credentials are missing. To create OAuth credentials, visit: %s", tailscaleDocsURL)
+// warnMissingTailscaleCredentials flags Tailscale enabled with no OAuth
+// credentials in either the config or a secret reference.
+func warnMissingTailscaleCredentials(cfg *config.Config) []string {
+	if cfg.Components == nil {
+		return nil
+	}
+	tsCfg, exists := cfg.Components["tailscale"]
+	if !exists {
+		return nil
+	}
+	if enabled, ok := tsCfg.Config["enabled"].(bool); ok && !enabled {
+		return nil
 	}
 
-	return nil
+	clientID, _ := tsCfg.Config["oauth_client_id"].(string)
+	clientSecret, _ := tsCfg.Config["oauth_client_secret"].(string)
+	if clientID != "" && clientSecret != "" {
+		return nil
+	}
+
+	return []string{fmt.Sprintf(
+		"Tailscale is enabled but stack.yaml carries no OAuth credentials. They must "+
+			"already be in OpenBAO at %s/%s, or 'foundry component install tailscale' "+
+			"will fail. To create an OAuth client: %s",
+		tailscale.SecretMount, tailscale.SecretPath, tailscaleDocsURL)}
 }

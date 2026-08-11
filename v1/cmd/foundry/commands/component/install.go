@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/catalystcommunity/foundry/v1/internal/component"
 	"github.com/catalystcommunity/foundry/v1/internal/component/certmanager"
@@ -24,6 +25,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/prometheus"
 	"github.com/catalystcommunity/foundry/v1/internal/component/seaweedfs"
 	componentStorage "github.com/catalystcommunity/foundry/v1/internal/component/storage"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/component/velero"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/dashboards"
@@ -126,6 +128,7 @@ var k8sComponents = map[string]bool{
 	"external-dns":       true,
 	"velero":             true,
 	"openbao-injector":   true,
+	"tailscale":          true,
 }
 
 func runInstall(ctx context.Context, cmd *cli.Command) error {
@@ -227,6 +230,13 @@ func installK8sComponent(ctx context.Context, cmd *cli.Command, name string, sta
 	// Add cluster VIP for components that need it
 	if stackConfig.Cluster.VIP != "" {
 		cfg["cluster_vip"] = stackConfig.Cluster.VIP
+	}
+
+	// Tailscale is wired by hand rather than through the Component interface:
+	// it needs OpenBAO for its OAuth credentials in addition to Helm and
+	// Kubernetes, and it writes back to the stack config.
+	if name == "tailscale" {
+		return installTailscaleComponent(ctx, cmd, stackConfig, helmClient, k8sClient)
 	}
 
 	// Create component-specific instance with clients and install
@@ -815,10 +825,147 @@ func installK3sComponent(ctx context.Context, stackConfig *config.Config, connec
 	return nil
 }
 
+// installTailscaleComponent installs or converges the Tailscale operator.
+//
+// The API VIP is deliberately not passed anywhere in this path: it is internal
+// to the cluster data plane, and advertising it on the tailnet is the topology
+// this work removed.
+func installTailscaleComponent(ctx context.Context, cmd *cli.Command, stackConfig *config.Config, helmClient *helm.Client, k8sClient *k8s.Client) error {
+	tsCfg, err := buildTailscaleConfig(ctx, cmd, stackConfig)
+	if err != nil {
+		return err
+	}
+
+	adapter, err := tailscale.NewKubeAdapter(k8sClient.Clientset(), k8sClient.DynamicClient())
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes adapter: %w", err)
+	}
+
+	helmInstaller, err := tailscale.NewHelmInstaller(helmClient, tsCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create Helm installer: %w", err)
+	}
+	crdInstaller, err := tailscale.NewCRDInstaller(adapter, tsCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create CRD installer: %w", err)
+	}
+	installer, err := tailscale.NewInstaller(helmInstaller, crdInstaller, adapter, tsCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create Tailscale installer: %w", err)
+	}
+
+	fmt.Println("\nInstalling component: tailscale")
+	if err := installer.Install(ctx); err != nil {
+		return fmt.Errorf("installation failed: %w", err)
+	}
+	fmt.Println("\n✓ Component tailscale installed successfully")
+
+	if len(tsCfg.AdvertiseRoutes) > 0 {
+		fmt.Printf("  Advertising subnet routes: %v\n", tsCfg.AdvertiseRoutes)
+	} else {
+		fmt.Println("  No subnet routes advertised (cluster networks stay internal)")
+	}
+
+	// Report what the operator is exposing, so a successful install says
+	// something useful rather than just "done".
+	checker, err := tailscale.NewHealthChecker(helmInstaller, adapter)
+	if err == nil {
+		if health, herr := checker.Check(ctx); herr == nil {
+			fmt.Printf("  %s\n", health.Summary())
+		}
+	}
+
+	return nil
+}
+
+// buildTailscaleConfig assembles the Tailscale component config from stack.yaml,
+// resolving OAuth credentials through OpenBAO.
+//
+// When credentials are supplied literally in stack.yaml they are written to
+// OpenBAO and the config is rewritten to reference them, so plaintext
+// credentials do not persist in the file.
+func buildTailscaleConfig(ctx context.Context, cmd *cli.Command, stackConfig *config.Config) (*tailscale.Config, error) {
+	compCfg := component.ComponentConfig{}
+	if comp, ok := stackConfig.Components["tailscale"]; ok {
+		for k, v := range comp.Config {
+			compCfg[k] = v
+		}
+	}
+
+	openbaoClient, err := createOpenBAOClient(stackConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OpenBAO client: %w\n\nTailscale credentials are stored in OpenBAO; install it first", err)
+	}
+
+	// A ${secret:...} reference means "read it from OpenBAO", so it is not a
+	// literal credential.
+	configID, _ := compCfg.GetString("oauth_client_id")
+	configSecret, _ := compCfg.GetString("oauth_client_secret")
+	if isSecretRef(configID) || isSecretRef(configSecret) {
+		configID, configSecret = "", ""
+	}
+
+	clientID, clientSecret, storedNew, err := tailscale.ResolveCredentials(ctx, openbaoClient, configID, configSecret)
+	if err != nil {
+		return nil, err
+	}
+	if storedNew {
+		fmt.Println("  ✓ Tailscale OAuth credentials stored in OpenBAO")
+		if err := replaceTailscaleCredentialRefs(cmd, stackConfig); err != nil {
+			fmt.Printf("  ⚠ Warning: credentials stored, but stack.yaml still holds them in plaintext: %v\n", err)
+		} else {
+			fmt.Println("  ✓ stack.yaml now references the stored credentials")
+		}
+	}
+
+	cfg := &tailscale.Config{
+		OAuthClientID:     &clientID,
+		OAuthClientSecret: &clientSecret,
+	}
+	if image, ok := compCfg.GetString("operator_image"); ok && image != "" {
+		cfg.OperatorImage = &image
+	}
+	if tags, ok := compCfg.GetStringSlice("tags"); ok {
+		cfg.Tags = tags
+	}
+	if routes, ok := compCfg.GetStringSlice("advertise_routes"); ok {
+		cfg.AdvertiseRoutes = routes
+	}
+
+	return cfg, nil
+}
+
+// replaceTailscaleCredentialRefs rewrites literal OAuth credentials in the
+// stack config as ${secret:...} references and saves it.
+func replaceTailscaleCredentialRefs(cmd *cli.Command, stackConfig *config.Config) error {
+	comp, ok := stackConfig.Components["tailscale"]
+	if !ok {
+		return fmt.Errorf("tailscale component not present in config")
+	}
+	if comp.Config == nil {
+		comp.Config = map[string]interface{}{}
+	}
+	comp.Config["oauth_client_id"] = "${secret:tailscale:client_id}"
+	comp.Config["oauth_client_secret"] = "${secret:tailscale:client_secret}"
+	stackConfig.Components["tailscale"] = comp
+
+	configPath, err := config.FindConfig(cmd.String("config"))
+	if err != nil {
+		return err
+	}
+	return config.Save(stackConfig, configPath)
+}
+
+// isSecretRef reports whether a config value is a ${secret:...} reference
+// rather than a literal credential.
+func isSecretRef(value string) bool {
+	return strings.HasPrefix(value, "${secret:") && strings.HasSuffix(value, "}")
+}
+
 // kubeconfigClientEndpoint returns the address remote clients should use to
 // reach the API server, derived from the first control plane host. Returns ""
-// when there is no cluster to point at, or when neither a Tailscale address nor
-// a VIP is configured.
+// when there is no cluster to point at, or when the host has no Tailscale
+// address, no VIP, and no usable node address.
 func kubeconfigClientEndpoint(stackConfig *config.Config) string {
 	if stackConfig == nil {
 		return ""
@@ -827,7 +974,10 @@ func kubeconfigClientEndpoint(stackConfig *config.Config) string {
 	if len(cpHosts) == 0 {
 		return ""
 	}
-	return k3s.ClientEndpoint(cpHosts[0].TailscaleAddress, stackConfig.Cluster.VIP)
+	// A host with no usable data plane address is reported by validation; here
+	// it simply contributes no fallback.
+	nodeIP, _ := cpHosts[0].K3sNodeIP()
+	return k3s.ClientEndpoint(cpHosts[0].TailscaleAddress, stackConfig.Cluster.VIP, nodeIP)
 }
 
 // reconcileKubeconfigEndpoint re-points the stored kubeconfig at the address
@@ -979,9 +1129,17 @@ func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) (*k3s.Config, 
 	if err != nil {
 		return nil, err
 	}
+	// The VIP is only carried into the node config when kube-vip is actually
+	// deployed for it. A configured-but-undeployed VIP stays out, so a single
+	// control plane cluster does not recreate kube-vip on reconcile; it is still
+	// added to the certificate SANs from stackConfig.Cluster.VIP below.
 	k3sConfig := &k3s.Config{
-		VIP:    stackConfig.Cluster.VIP,
 		NodeIP: nodeIP,
+	}
+	if stackConfig.VIPEnabled() {
+		k3sConfig.VIP = stackConfig.Cluster.VIP
+	} else if stackConfig.Cluster.VIP != "" {
+		k3sConfig.TLSSANs = append(k3sConfig.TLSSANs, stackConfig.Cluster.VIP)
 	}
 	k3sConfig.FlannelIface = h.FlannelInterface
 	k3sConfig.AdvertiseAddress = k3sConfig.NodeIP
@@ -1177,10 +1335,15 @@ func registerComponentDNS(ctx context.Context, componentName string, stackConfig
 			return fmt.Errorf("no Zot host configured: %w", err)
 		}
 	case "k8s":
-		if stackConfig.Cluster.VIP == "" {
-			return fmt.Errorf("no K8s VIP configured")
+		// The API is reached at the VIP when one is deployed, and at the control
+		// plane node's own address otherwise.
+		ip, err = stackConfig.APIEndpoint()
+		if err != nil {
+			return fmt.Errorf("no K8s API endpoint configured: %w", err)
 		}
-		ip = stackConfig.Cluster.VIP
+		if ip == "" {
+			return fmt.Errorf("no K8s API endpoint configured: no control plane host is defined")
+		}
 	default:
 		return fmt.Errorf("unknown component: %s", componentName)
 	}

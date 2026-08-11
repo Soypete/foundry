@@ -4,6 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/catalystcommunity/foundry/v1/cmd/foundry/registry"
+	"github.com/catalystcommunity/foundry/v1/internal/component"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/config"
 	"github.com/catalystcommunity/foundry/v1/internal/host"
 	"github.com/stretchr/testify/assert"
@@ -165,9 +168,14 @@ func TestWarnMissingControlPlaneTailscaleAddressExcludesHealthyHosts(t *testing.
 
 func TestCollectConfigWarnings(t *testing.T) {
 	t.Run("surfaces the missing tailscale address warning", func(t *testing.T) {
+		// Two control planes, so the VIP is deployed and does not warn on its
+		// own; the tailscale address warning is the one under test.
 		cfg := &config.Config{
 			Cluster: config.ClusterConfig{VIP: warnVIP},
-			Hosts:   []*host.Host{controlPlaneHost("blue1", "192.168.1.185", "")},
+			Hosts: []*host.Host{
+				controlPlaneHost("blue1", "192.168.1.185", ""),
+				controlPlaneHost("blue2", "192.168.1.97", warnTailscale2),
+			},
 		}
 		warnings := collectConfigWarnings(cfg)
 		require.Len(t, warnings, 1)
@@ -177,7 +185,30 @@ func TestCollectConfigWarnings(t *testing.T) {
 	t.Run("returns nothing for a fully configured stack", func(t *testing.T) {
 		cfg := &config.Config{
 			Cluster: config.ClusterConfig{VIP: warnVIP},
+			Hosts: []*host.Host{
+				controlPlaneHost("blue1", "192.168.1.185", warnTailscale1),
+				controlPlaneHost("blue2", "192.168.1.97", warnTailscale2),
+			},
+		}
+		assert.Empty(t, collectConfigWarnings(cfg))
+	})
+
+	t.Run("warns about a VIP that will not be deployed", func(t *testing.T) {
+		// blue1's situation: one control plane host with a VIP still in
+		// stack.yaml. Foundry stops deploying kube-vip for it, and says so.
+		cfg := &config.Config{
+			Cluster: config.ClusterConfig{VIP: warnVIP},
 			Hosts:   []*host.Host{controlPlaneHost("blue1", "192.168.1.185", warnTailscale1)},
+		}
+		warnings := collectConfigWarnings(cfg)
+		require.Len(t, warnings, 1)
+		assert.Contains(t, warnings[0], warnVIP)
+		assert.Contains(t, warnings[0], "one control plane host")
+	})
+
+	t.Run("does not warn when no VIP is configured", func(t *testing.T) {
+		cfg := &config.Config{
+			Hosts: []*host.Host{controlPlaneHost("blue1", "192.168.1.185", warnTailscale1)},
 		}
 		assert.Empty(t, collectConfigWarnings(cfg))
 	})
@@ -202,4 +233,108 @@ func TestWarningsAreAdvisoryNotFatal(t *testing.T) {
 	for _, w := range warnings {
 		assert.False(t, strings.HasPrefix(w, "✗"), "advisory text must not read as a failure")
 	}
+}
+
+// TestValidateComponentDependenciesAgainstRealRegistry guards the component
+// names in validateComponentDependencies against the real registry rather than
+// mocks.
+//
+// The hardcoded list previously said "certmanager" while the component
+// registers itself as "cert-manager", so `foundry stack validate` failed on
+// every config. The existing test missed it because it registered a mock under
+// the misspelled name -- it validated its own fixture, not reality.
+func TestValidateComponentDependenciesAgainstRealRegistry(t *testing.T) {
+	original := component.DefaultRegistry
+	t.Cleanup(func() { component.DefaultRegistry = original })
+
+	component.DefaultRegistry = component.NewRegistry()
+	require.NoError(t, registry.InitComponents(), "production registry must initialize")
+
+	err := validateComponentDependencies(&config.Config{
+		Components: config.ComponentMap{"openbao": {}},
+	})
+	assert.NoError(t, err, "every name in validateComponentDependencies must exist in the real registry")
+}
+
+// TestWarnMissingTailscaleCredentials covers the advisory for Tailscale enabled
+// without credentials in stack.yaml.
+//
+// This must not be a validation failure: OpenBAO is the authoritative store, so
+// a config that never carried credentials literally is valid. Whether they
+// resolve is decided at install time, which is the only place with a client.
+func TestWarnMissingTailscaleCredentials(t *testing.T) {
+	tsComponent := func(cfg map[string]interface{}) *config.Config {
+		return &config.Config{
+			Cluster:    config.ClusterConfig{VIP: warnVIP},
+			Components: config.ComponentMap{"tailscale": {Config: cfg}},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		cfg         *config.Config
+		wantWarning bool
+	}{
+		{
+			name:        "enabled with no credentials warns",
+			cfg:         tsComponent(map[string]interface{}{}),
+			wantWarning: true,
+		},
+		{
+			name: "secret references count as present",
+			cfg: tsComponent(map[string]interface{}{
+				"oauth_client_id":     "${secret:tailscale:client_id}",
+				"oauth_client_secret": "${secret:tailscale:client_secret}",
+			}),
+			wantWarning: false,
+		},
+		{
+			name: "literal credentials count as present",
+			cfg: tsComponent(map[string]interface{}{
+				"oauth_client_id":     "literal-id",
+				"oauth_client_secret": "literal-secret",
+			}),
+			wantWarning: false,
+		},
+		{
+			name: "only one credential still warns",
+			cfg: tsComponent(map[string]interface{}{
+				"oauth_client_id": "${secret:tailscale:client_id}",
+			}),
+			wantWarning: true,
+		},
+		{
+			name:        "explicitly disabled does not warn",
+			cfg:         tsComponent(map[string]interface{}{"enabled": false}),
+			wantWarning: false,
+		},
+		{
+			name:        "component absent does not warn",
+			cfg:         &config.Config{Cluster: config.ClusterConfig{VIP: warnVIP}},
+			wantWarning: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			warnings := warnMissingTailscaleCredentials(tt.cfg)
+			if !tt.wantWarning {
+				assert.Empty(t, warnings)
+				return
+			}
+			require.Len(t, warnings, 1)
+			assert.Contains(t, warnings[0], "OpenBAO")
+			assert.Contains(t, warnings[0], tailscale.DocsURL)
+		})
+	}
+}
+
+// TestValidateTailscaleConfigNeverFailsOnMissingCredentials guards the change
+// from a hard failure to an advisory: a config whose credentials live only in
+// OpenBAO must still validate.
+func TestValidateTailscaleConfigNeverFailsOnMissingCredentials(t *testing.T) {
+	cfg := &config.Config{
+		Components: config.ComponentMap{"tailscale": {Config: map[string]interface{}{}}},
+	}
+	assert.NoError(t, validateTailscaleConfig(cfg))
 }

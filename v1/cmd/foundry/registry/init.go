@@ -16,6 +16,7 @@ import (
 	"github.com/catalystcommunity/foundry/v1/internal/component/prometheus"
 	"github.com/catalystcommunity/foundry/v1/internal/component/seaweedfs"
 	"github.com/catalystcommunity/foundry/v1/internal/component/storage"
+	"github.com/catalystcommunity/foundry/v1/internal/component/tailscale"
 	"github.com/catalystcommunity/foundry/v1/internal/component/velero"
 	"github.com/catalystcommunity/foundry/v1/internal/component/zot"
 )
@@ -50,6 +51,13 @@ func InitComponents() error {
 	// from OpenBao via vault.hashicorp.com/agent-inject annotations
 	openbaoInjectorComp := openbaoinjector.NewComponent(nil, nil, nil)
 	if err := component.Register(openbaoInjectorComp); err != nil {
+		return err
+	}
+
+	// Register Tailscale - depends on K3s for the cluster and OpenBAO for the
+	// operator's OAuth credentials. Installation is driven by the install
+	// command, which supplies the Helm/Kubernetes/OpenBAO clients.
+	if err := component.Register(&tailscale.Component{}); err != nil {
 		return err
 	}
 

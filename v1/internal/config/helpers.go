@@ -50,6 +50,40 @@ func (c *Config) GetZotHosts() []*host.Host {
 	return c.GetHostsByRole(host.RoleZot)
 }
 
+// VIPEnabled reports whether kube-vip should be deployed for this cluster.
+//
+// A VIP is a floating address that kube-vip moves between control plane nodes,
+// so it only means anything when there is more than one of them. With a single
+// control plane it provides no failover, and because kube-vip carries it as a
+// secondary address on the same interface Flannel uses, it can be selected as
+// the Flannel VXLAN endpoint -- which sends pod traffic to an address that
+// belongs to the API server role rather than to a specific node.
+//
+// This is derived rather than configured so that an existing single-control-
+// plane stack.yaml that still sets cluster.vip stops deploying kube-vip on the
+// next reconcile, without the operator having to edit the file first.
+func (c *Config) VIPEnabled() bool {
+	return c.Cluster.VIP != "" && len(c.GetClusterControlPlaneHosts()) > 1
+}
+
+// APIEndpoint returns the address clients and joining nodes should use to reach
+// the Kubernetes API: the VIP when one is deployed, otherwise the first control
+// plane node's own address.
+//
+// Returns an empty string when there is no cluster to point at, and an error
+// when the first control plane host has no address usable for the K3s data
+// plane.
+func (c *Config) APIEndpoint() (string, error) {
+	if c.VIPEnabled() {
+		return c.Cluster.VIP, nil
+	}
+	cpHosts := c.GetClusterControlPlaneHosts()
+	if len(cpHosts) == 0 {
+		return "", nil
+	}
+	return cpHosts[0].K3sNodeIP()
+}
+
 // GetClusterControlPlaneHosts returns all hosts with the cluster-control-plane role
 func (c *Config) GetClusterControlPlaneHosts() []*host.Host {
 	return c.GetHostsByRole(host.RoleClusterControlPlane)

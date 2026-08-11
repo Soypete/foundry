@@ -40,15 +40,36 @@ func convertToK3sNodes(hosts []*host.Host) []k3s.NodeConfig {
 	return k3sNodes
 }
 
-func nodeIPForHost(h *host.Host) string {
-	if h.NodeIP != "" {
-		return h.NodeIP
+// deployedVIP returns the VIP to put in a node's K3s config: the configured one
+// when kube-vip is deployed for it, and otherwise nothing.
+//
+// A configured-but-undeployed VIP must not reach k3s.Config, or reconciling a
+// single control plane cluster would recreate the kube-vip that makes the VIP
+// selectable as the Flannel endpoint. It is still added to the certificate SANs
+// separately, so growing a second control plane later needs no new certificate.
+func deployedVIP(cfg *config.Config) string {
+	if cfg.VIPEnabled() {
+		return cfg.Cluster.VIP
 	}
-	return h.Address
+	return ""
 }
 
-func applyHostNetwork(h *host.Host, cfg *k3s.Config) {
-	cfg.NodeIP = nodeIPForHost(h)
+// nodeIPForHost returns the address K3s should use for the data plane.
+//
+// It delegates to host.K3sNodeIP so this path applies the same guard as the
+// component install path: a CGNAT address belongs to an overlay such as
+// Tailscale, and silently adopting it as node-ip puts Flannel's VXLAN endpoint
+// on the overlay.
+func nodeIPForHost(h *host.Host) (string, error) {
+	return h.K3sNodeIP()
+}
+
+func applyHostNetwork(h *host.Host, cfg *k3s.Config, vip string) error {
+	nodeIP, err := nodeIPForHost(h)
+	if err != nil {
+		return fmt.Errorf("host %s: %w", h.Hostname, err)
+	}
+	cfg.NodeIP = nodeIP
 	cfg.FlannelIface = h.FlannelInterface
 	if cfg.AdvertiseAddress == "" {
 		cfg.AdvertiseAddress = cfg.NodeIP
@@ -56,13 +77,23 @@ func applyHostNetwork(h *host.Host, cfg *k3s.Config) {
 	if h.TailscaleAddress != "" {
 		cfg.TLSSANs = append(cfg.TLSSANs, h.TailscaleAddress)
 	}
+	// The configured VIP is a valid API endpoint name whether or not kube-vip
+	// is deployed for it, so it belongs in the certificate either way.
+	if vip != "" {
+		cfg.TLSSANs = append(cfg.TLSSANs, vip)
+	}
+	return nil
 }
 
 // apiClientAddress is the endpoint remote clients use to reach the API server.
 // The rule lives in the k3s package so the install/repair path applies the same
 // one; see k3s.ClientEndpoint.
 func apiClientAddress(h *host.Host, vip string) string {
-	return k3s.ClientEndpoint(h.TailscaleAddress, vip)
+	// A failure here means the host has no usable data plane address, which the
+	// caller surfaces separately; fall back to the empty string so the endpoint
+	// rule stays in one place.
+	nodeIP, _ := h.K3sNodeIP()
+	return k3s.ClientEndpoint(h.TailscaleAddress, vip, nodeIP)
 }
 
 func initCommand() *cli.Command {
@@ -70,10 +101,6 @@ func initCommand() *cli.Command {
 		Name:  "init",
 		Usage: "Initialize Kubernetes cluster",
 		Flags: []cli.Flag{
-			&cli.BoolFlag{
-				Name:  "single-node",
-				Usage: "Initialize single-node cluster (overrides config)",
-			},
 			&cli.BoolFlag{
 				Name:  "dry-run",
 				Usage: "Show what would be done without making changes",
@@ -106,15 +133,6 @@ func runClusterInit(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("no hosts with cluster roles (cluster-control-plane or cluster-worker) defined")
 	}
 
-	// Override with single-node flag if provided
-	singleNode := cmd.Bool("single-node")
-	if singleNode {
-		if len(clusterHosts) > 1 {
-			fmt.Println("Warning: --single-node flag will use only the first node")
-			clusterHosts = clusterHosts[:1]
-		}
-	}
-
 	dryRun := cmd.Bool("dry-run")
 	if dryRun {
 		fmt.Println("Dry-run mode enabled - no changes will be made")
@@ -145,7 +163,14 @@ func printClusterPlan(cfg *config.Config) error {
 	fmt.Println("\nCluster initialization plan:")
 	fmt.Printf("  Cluster name: %s\n", cfg.Cluster.Name)
 	fmt.Printf("  Domain: %s\n", cfg.Cluster.PrimaryDomain)
-	fmt.Printf("  VIP: %s\n", cfg.Cluster.VIP)
+	switch {
+	case cfg.VIPEnabled():
+		fmt.Printf("  VIP: %s\n", cfg.Cluster.VIP)
+	case cfg.Cluster.VIP != "":
+		fmt.Printf("  VIP: %s (certificate SAN only; not deployed for a single control plane)\n", cfg.Cluster.VIP)
+	default:
+		fmt.Println("  VIP: none (single control plane)")
+	}
 	fmt.Println("\nHosts:")
 
 	// Get cluster hosts and determine node roles
@@ -166,7 +191,11 @@ func printClusterPlan(cfg *config.Config) error {
 	fmt.Println("  3. Determine node roles")
 	fmt.Println("  4. Find first control plane node")
 	fmt.Println("  5. Install control plane on first node(s)")
-	fmt.Println("  6. Set up kube-vip for VIP")
+	if cfg.VIPEnabled() {
+		fmt.Println("  6. Set up kube-vip for VIP")
+	} else {
+		fmt.Println("  6. Skip kube-vip (no VIP deployed for a single control plane)")
+	}
 	fmt.Println("  7. Join additional control plane nodes (if any)")
 	fmt.Println("  8. Join worker nodes (if any)")
 	fmt.Println("  9. Retrieve and store kubeconfig in OpenBAO")
@@ -310,16 +339,17 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 		ServerURL:    "",
 		ClusterToken: tokens.ClusterToken,
 		AgentToken:   tokens.AgentToken,
-		VIP:          cfg.Cluster.VIP,
+		VIP:          deployedVIP(cfg),
 		TLSSANs: []string{
-			cfg.Cluster.VIP,
 			firstHost.Address,
 			fmt.Sprintf("%s.%s", cfg.Cluster.Name, cfg.Cluster.PrimaryDomain),
 		},
 		DisableComponents: []string{"traefik", "servicelb"},
 		AllowCGNATVIP:     cfg.Cluster.AllowCGNATVIP,
 	}
-	applyHostNetwork(firstHost, k3sConfig)
+	if err := applyHostNetwork(firstHost, k3sConfig, cfg.Cluster.VIP); err != nil {
+		return err
+	}
 	if err := k3s.ResolveNodeNetwork(conn, k3sConfig); err != nil {
 		return fmt.Errorf("failed to resolve network for %s: %w", firstHost.Hostname, err)
 	}
@@ -357,7 +387,11 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 
 	// Step 7: Join additional control plane nodes
 	// Cluster joins use the physical LAN, independently of the API VIP and remote-access plane.
-	serverURL := fmt.Sprintf("https://%s:6443", nodeIPForHost(firstHost))
+	firstHostNodeIP, err := nodeIPForHost(firstHost)
+	if err != nil {
+		return fmt.Errorf("host %s: %w", firstHost.Hostname, err)
+	}
+	serverURL := fmt.Sprintf("https://%s:6443", firstHostNodeIP)
 	for i := firstCPIndex + 1; i < len(clusterHosts); i++ {
 		role := nodeRoles[i]
 		if !role.IsControlPlane {
@@ -386,7 +420,10 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 			EtcdArgs:          k3sConfig.EtcdArgs,
 			AllowCGNATVIP:     k3sConfig.AllowCGNATVIP,
 		}
-		applyHostNetwork(h, joinConfig)
+		if err := applyHostNetwork(h, joinConfig, cfg.Cluster.VIP); err != nil {
+			conn.Close()
+			return err
+		}
 		if err := k3s.ResolveNodeNetwork(conn, joinConfig); err != nil {
 			conn.Close()
 			return fmt.Errorf("failed to resolve network for %s: %w", h.Hostname, err)
@@ -427,7 +464,10 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 			RegistryConfig: k3sConfig.RegistryConfig,
 			VIP:            cfg.Cluster.VIP,
 		}
-		applyHostNetwork(h, workerConfig)
+		if err := applyHostNetwork(h, workerConfig, cfg.Cluster.VIP); err != nil {
+			conn.Close()
+			return err
+		}
 		if err := k3s.ResolveNodeNetwork(conn, workerConfig); err != nil {
 			conn.Close()
 			return fmt.Errorf("failed to resolve network for %s: %w", h.Hostname, err)
@@ -489,7 +529,11 @@ func InitializeCluster(ctx context.Context, cfg *config.Config) error {
 			peerConnections = append(peerConnections, peerConn)
 			peer = peerConn
 		}
-		validationNodes = append(validationNodes, k3s.FlannelNode{Name: h.Hostname, NodeIP: nodeIPForHost(h), Peer: peer})
+		hostNodeIP, nodeIPErr := nodeIPForHost(h)
+		if nodeIPErr != nil {
+			return fmt.Errorf("host %s: %w", h.Hostname, nodeIPErr)
+		}
+		validationNodes = append(validationNodes, k3s.FlannelNode{Name: h.Hostname, NodeIP: hostNodeIP, Peer: peer})
 	}
 	defer func() {
 		for _, peer := range peerConnections {

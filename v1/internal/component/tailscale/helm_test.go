@@ -2,6 +2,8 @@ package tailscale
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,35 +12,47 @@ import (
 
 // mockHelmClient implements a mock Helm client for testing
 type mockHelmClient struct {
-	addRepoErr     error
-	installErr     error
-	uninstallErr   error
-	reposAdded     []helm.RepoAddOptions
-	chartsInstalled []helm.InstallOptions
-	chartsUninstalled []helm.UninstallOptions
+	addRepoErr   error
+	installErr   error
+	upgradeErr   error
+	uninstallErr error
+	listErr      error
+
+	// releases is what List returns, letting a test model an operator that is
+	// already installed.
+	releases []helm.Release
+
+	repoAddCalls   []helm.RepoAddOptions
+	installCalls   []helm.InstallOptions
+	upgradeCalls   []helm.UpgradeOptions
+	uninstallCalls []helm.UninstallOptions
 }
 
 func (m *mockHelmClient) AddRepo(ctx context.Context, opts helm.RepoAddOptions) error {
-	m.reposAdded = append(m.reposAdded, opts)
+	m.repoAddCalls = append(m.repoAddCalls, opts)
 	return m.addRepoErr
 }
 
 func (m *mockHelmClient) Install(ctx context.Context, opts helm.InstallOptions) error {
-	m.chartsInstalled = append(m.chartsInstalled, opts)
+	m.installCalls = append(m.installCalls, opts)
 	return m.installErr
 }
 
+func (m *mockHelmClient) Upgrade(ctx context.Context, opts helm.UpgradeOptions) error {
+	m.upgradeCalls = append(m.upgradeCalls, opts)
+	return m.upgradeErr
+}
+
 func (m *mockHelmClient) Uninstall(ctx context.Context, opts helm.UninstallOptions) error {
-	m.chartsUninstalled = append(m.chartsUninstalled, opts)
+	m.uninstallCalls = append(m.uninstallCalls, opts)
 	return m.uninstallErr
 }
 
-func (m *mockHelmClient) Upgrade(ctx context.Context, opts helm.UpgradeOptions) error {
-	return nil
-}
-
 func (m *mockHelmClient) List(ctx context.Context, namespace string) ([]helm.Release, error) {
-	return nil, nil
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	return m.releases, nil
 }
 
 func (m *mockHelmClient) Get(ctx context.Context, releaseName, namespace string) (*helm.Release, error) {
@@ -145,8 +159,8 @@ func TestHelmInstaller_AddRepository(t *testing.T) {
 			}
 
 			// Verify repo was added with correct parameters
-			if !tt.wantErr && len(mockClient.reposAdded) == 1 {
-				repo := mockClient.reposAdded[0]
+			if !tt.wantErr && len(mockClient.repoAddCalls) == 1 {
+				repo := mockClient.repoAddCalls[0]
 				if repo.Name != TailscaleRepoName {
 					t.Errorf("Repository name = %q, want %q", repo.Name, TailscaleRepoName)
 				}
@@ -209,16 +223,17 @@ func TestHelmInstaller_InstallOperator(t *testing.T) {
 			installErr: nil,
 			wantErr:    false,
 			checkOpts: func(t *testing.T, opts helm.InstallOptions) {
-				// Verify values contain custom image
+				// Verify values carry the custom image, split into repository
+				// and tag under operatorConfig.
 				if opts.Values == nil {
 					t.Fatal("Expected Values to be set")
 				}
-				if imageMap, ok := opts.Values["image"].(map[string]interface{}); ok {
-					if imageMap["repository"] != "custom/operator:v1.0.0" {
-						t.Errorf("image.repository = %v, want custom/operator:v1.0.0", imageMap["repository"])
-					}
-				} else {
-					t.Error("Expected image in values")
+				image := operatorConfigImage(t, opts.Values)
+				if image["repository"] != "custom/operator" {
+					t.Errorf("image.repository = %v, want custom/operator", image["repository"])
+				}
+				if image["tag"] != "v1.0.0" {
+					t.Errorf("image.tag = %v, want v1.0.0", image["tag"])
 				}
 			},
 		},
@@ -251,8 +266,8 @@ func TestHelmInstaller_InstallOperator(t *testing.T) {
 			}
 
 			// Verify install was called with correct parameters
-			if !tt.wantErr && len(mockClient.chartsInstalled) == 1 && tt.checkOpts != nil {
-				tt.checkOpts(t, mockClient.chartsInstalled[0])
+			if !tt.wantErr && len(mockClient.installCalls) == 1 && tt.checkOpts != nil {
+				tt.checkOpts(t, mockClient.installCalls[0])
 			}
 		})
 	}
@@ -297,8 +312,8 @@ func TestHelmInstaller_UninstallOperator(t *testing.T) {
 			}
 
 			// Verify uninstall was called with correct parameters
-			if !tt.wantErr && len(mockClient.chartsUninstalled) == 1 {
-				opts := mockClient.chartsUninstalled[0]
+			if !tt.wantErr && len(mockClient.uninstallCalls) == 1 {
+				opts := mockClient.uninstallCalls[0]
 				if opts.ReleaseName != OperatorReleaseName {
 					t.Errorf("ReleaseName = %q, want %q", opts.ReleaseName, OperatorReleaseName)
 				}
@@ -317,112 +332,178 @@ func TestHelmInstaller_UninstallOperator(t *testing.T) {
 }
 
 func TestHelmInstaller_GenerateHelmValues(t *testing.T) {
+	t.Run("nil config errors", func(t *testing.T) {
+		installer := &HelmInstaller{}
+		_, err := installer.generateHelmValues()
+		if err == nil {
+			t.Fatal("expected error for nil config")
+		}
+	})
+
+	// OAuth credentials in Helm values are persisted in cleartext in the
+	// release secret and exposed by `helm get values`. They belong in the
+	// operator-oauth Kubernetes secret instead.
+	t.Run("never contains OAuth credentials", func(t *testing.T) {
+		installer := helmInstallerFor(t, &Config{
+			OAuthClientID:     stringPtr("client-123"),
+			OAuthClientSecret: stringPtr("secret-456"),
+		})
+
+		values, err := installer.generateHelmValues()
+		if err != nil {
+			t.Fatalf("generateHelmValues() unexpected error: %v", err)
+		}
+		rendered := fmt.Sprintf("%v", values)
+		if strings.Contains(rendered, "secret-456") || strings.Contains(rendered, "client-123") {
+			t.Errorf("OAuth credentials leaked into Helm values: %s", rendered)
+		}
+		if _, exists := values["oauth"]; exists {
+			t.Error("values must not carry an oauth block")
+		}
+	})
+
+	t.Run("minimal config produces no image override", func(t *testing.T) {
+		installer := helmInstallerFor(t, &Config{
+			OAuthClientID:     stringPtr("client-123"),
+			OAuthClientSecret: stringPtr("secret-456"),
+		})
+
+		values, err := installer.generateHelmValues()
+		if err != nil {
+			t.Fatalf("generateHelmValues() unexpected error: %v", err)
+		}
+		if _, exists := values["operatorConfig"]; exists {
+			t.Error("expected no operatorConfig for a minimal config")
+		}
+	})
+
+	t.Run("splits operator image into repository and tag", func(t *testing.T) {
+		installer := helmInstallerFor(t, &Config{
+			OAuthClientID:     stringPtr("client-123"),
+			OAuthClientSecret: stringPtr("secret-456"),
+			OperatorImage:     stringPtr("custom/operator:v1.0.0"),
+		})
+
+		values, err := installer.generateHelmValues()
+		if err != nil {
+			t.Fatalf("generateHelmValues() unexpected error: %v", err)
+		}
+		image := operatorConfigImage(t, values)
+		if image["repository"] != "custom/operator" {
+			t.Errorf("repository = %v, want custom/operator", image["repository"])
+		}
+		if image["tag"] != "v1.0.0" {
+			t.Errorf("tag = %v, want v1.0.0", image["tag"])
+		}
+	})
+
+	t.Run("empty operator image adds nothing", func(t *testing.T) {
+		installer := helmInstallerFor(t, &Config{
+			OAuthClientID:     stringPtr("client-123"),
+			OAuthClientSecret: stringPtr("secret-456"),
+			OperatorImage:     stringPtr(""),
+		})
+
+		values, err := installer.generateHelmValues()
+		if err != nil {
+			t.Fatalf("generateHelmValues() unexpected error: %v", err)
+		}
+		if _, exists := values["operatorConfig"]; exists {
+			t.Error("expected no operatorConfig for an empty image string")
+		}
+	})
+
+	t.Run("passes configured tags as defaultTags", func(t *testing.T) {
+		installer := helmInstallerFor(t, &Config{
+			OAuthClientID:     stringPtr("client-123"),
+			OAuthClientSecret: stringPtr("secret-456"),
+			Tags:              []string{"tag:production"},
+		})
+
+		values, err := installer.generateHelmValues()
+		if err != nil {
+			t.Fatalf("generateHelmValues() unexpected error: %v", err)
+		}
+		opCfg, ok := values["operatorConfig"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected operatorConfig in values")
+		}
+		tags, ok := opCfg["defaultTags"].([]string)
+		if !ok || len(tags) != 1 || tags[0] != "tag:production" {
+			t.Errorf("defaultTags = %v, want [tag:production]", opCfg["defaultTags"])
+		}
+	})
+
+	// Image and tags both write operatorConfig; neither may clobber the other.
+	t.Run("image and tags coexist under operatorConfig", func(t *testing.T) {
+		installer := helmInstallerFor(t, &Config{
+			OAuthClientID:     stringPtr("client-123"),
+			OAuthClientSecret: stringPtr("secret-456"),
+			OperatorImage:     stringPtr("custom/operator:v1.0.0"),
+			Tags:              []string{"tag:production"},
+		})
+
+		values, err := installer.generateHelmValues()
+		if err != nil {
+			t.Fatalf("generateHelmValues() unexpected error: %v", err)
+		}
+		opCfg := values["operatorConfig"].(map[string]interface{})
+		if _, ok := opCfg["image"]; !ok {
+			t.Error("image missing from operatorConfig")
+		}
+		if _, ok := opCfg["defaultTags"]; !ok {
+			t.Error("defaultTags missing from operatorConfig")
+		}
+	})
+}
+
+func TestSplitImageRef(t *testing.T) {
 	tests := []struct {
-		name    string
-		config  *Config
-		wantErr bool
-		check   func(t *testing.T, values map[string]interface{})
+		image    string
+		wantRepo string
+		wantTag  string
 	}{
-		{
-			name:    "nil config",
-			config:  nil,
-			wantErr: true,
-		},
-		{
-			name: "missing OAuth credentials",
-			config: &Config{
-				OAuthClientID: stringPtr("client-123"),
-				// Missing OAuthClientSecret
-			},
-			wantErr: true,
-		},
-		{
-			name: "minimal valid config",
-			config: &Config{
-				OAuthClientID:     stringPtr("client-123"),
-				OAuthClientSecret: stringPtr("secret-456"),
-			},
-			wantErr: false,
-			check: func(t *testing.T, values map[string]interface{}) {
-				oauth, ok := values["oauth"].(map[string]interface{})
-				if !ok {
-					t.Fatal("Expected oauth in values")
-				}
-				if oauth["clientId"] != "client-123" {
-					t.Errorf("oauth.clientId = %v, want client-123", oauth["clientId"])
-				}
-				if oauth["clientSecret"] != "secret-456" {
-					t.Errorf("oauth.clientSecret = %v, want secret-456", oauth["clientSecret"])
-				}
-				// No image should be set
-				if _, exists := values["image"]; exists {
-					t.Error("Expected no image in values for minimal config")
-				}
-			},
-		},
-		{
-			name: "config with custom operator image",
-			config: &Config{
-				OAuthClientID:     stringPtr("client-123"),
-				OAuthClientSecret: stringPtr("secret-456"),
-				OperatorImage:     stringPtr("custom/operator:v1.0.0"),
-			},
-			wantErr: false,
-			check: func(t *testing.T, values map[string]interface{}) {
-				image, ok := values["image"].(map[string]interface{})
-				if !ok {
-					t.Fatal("Expected image in values")
-				}
-				if image["repository"] != "custom/operator:v1.0.0" {
-					t.Errorf("image.repository = %v, want custom/operator:v1.0.0", image["repository"])
-				}
-			},
-		},
-		{
-			name: "config with empty operator image string",
-			config: &Config{
-				OAuthClientID:     stringPtr("client-123"),
-				OAuthClientSecret: stringPtr("secret-456"),
-				OperatorImage:     stringPtr(""),
-			},
-			wantErr: false,
-			check: func(t *testing.T, values map[string]interface{}) {
-				// Empty string should not add image to values
-				if _, exists := values["image"]; exists {
-					t.Error("Expected no image in values for empty string")
-				}
-			},
-		},
+		{"tailscale/operator:latest", "tailscale/operator", "latest"},
+		{"tailscale/operator", "tailscale/operator", ""},
+		{"custom/operator:v1.0.0", "custom/operator", "v1.0.0"},
+		// A registry port must not be mistaken for a tag.
+		{"registry:5000/tailscale/operator", "registry:5000/tailscale/operator", ""},
+		{"registry:5000/tailscale/operator:v1.2", "registry:5000/tailscale/operator", "v1.2"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var installer *HelmInstaller
-			if tt.config != nil {
-				mockClient := &mockHelmClient{}
-				var err error
-				installer, err = NewHelmInstaller(mockClient, tt.config)
-				if err != nil && !tt.wantErr {
-					t.Fatalf("NewHelmInstaller() unexpected error: %v", err)
-				}
-				if err != nil && tt.wantErr {
-					return // Expected error during construction
-				}
-			} else {
-				installer = &HelmInstaller{config: tt.config}
-			}
-
-			values, err := installer.generateHelmValues()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("generateHelmValues() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-
-			if !tt.wantErr && tt.check != nil {
-				tt.check(t, values)
+		t.Run(tt.image, func(t *testing.T) {
+			repo, tag := splitImageRef(tt.image)
+			if repo != tt.wantRepo || tag != tt.wantTag {
+				t.Errorf("splitImageRef(%q) = (%q, %q), want (%q, %q)",
+					tt.image, repo, tag, tt.wantRepo, tt.wantTag)
 			}
 		})
 	}
+}
+
+// helmInstallerFor builds a HelmInstaller over a mock client.
+func helmInstallerFor(t *testing.T, cfg *Config) *HelmInstaller {
+	t.Helper()
+	installer, err := NewHelmInstaller(&mockHelmClient{}, cfg)
+	if err != nil {
+		t.Fatalf("NewHelmInstaller() unexpected error: %v", err)
+	}
+	return installer
+}
+
+// operatorConfigImage extracts operatorConfig.image from Helm values.
+func operatorConfigImage(t *testing.T, values map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	opCfg, ok := values["operatorConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected operatorConfig in values")
+	}
+	image, ok := opCfg["image"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected operatorConfig.image in values")
+	}
+	return image
 }
 
 func TestGenerateSecretData(t *testing.T) {

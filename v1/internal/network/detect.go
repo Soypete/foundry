@@ -30,6 +30,40 @@ func DetectInterfaceForIP(conn SSHExecutor, ip string) (string, error) {
 	return iface, nil
 }
 
+// InterfaceAddresses returns the IPv4 addresses assigned to an interface,
+// without their prefix lengths.
+//
+// An interface can legitimately carry more than one address, which is how a
+// kube-vip VIP ends up beside the node's own address on the same NIC. Callers
+// that pin something to an interface by name need to see all of them to know
+// which address that name will actually resolve to.
+func InterfaceAddresses(conn SSHExecutor, iface string) ([]string, error) {
+	result, err := conn.Exec(fmt.Sprintf("ip -o -4 addr show dev %s | awk '{print $4}'", iface))
+	if err != nil {
+		return nil, fmt.Errorf("failed to list addresses on %s: %w", iface, err)
+	}
+	if result.ExitCode != 0 {
+		return nil, fmt.Errorf("failed to list addresses on %s: %s", iface, result.Stderr)
+	}
+
+	var addrs []string
+	for _, line := range strings.Split(strings.TrimSpace(result.Stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Each line is CIDR notation, e.g. "192.168.1.185/24".
+		addr, _, found := strings.Cut(line, "/")
+		if !found {
+			addr = line
+		}
+		if net.ParseIP(addr) != nil {
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs, nil
+}
+
 // SSHExecutor is an interface for executing SSH commands
 // This allows for easier testing with mocks
 type SSHExecutor interface {
