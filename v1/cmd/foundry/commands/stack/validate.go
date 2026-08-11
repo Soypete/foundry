@@ -113,10 +113,37 @@ func validateNetworkConfig(cfg *config.Config) error {
 	return nil
 }
 
+// dnsComponentEnabled reports whether Foundry is running the DNS component.
+//
+// DNS is opt-out rather than opt-in: it has been a core component, so a config
+// that never mentions `enabled` is running it and must keep being validated.
+// Only an explicit `enabled: false` turns it off. This differs deliberately from
+// componentEnabled in install.go, which governs opt-in components where an
+// absent key means off.
+func dnsComponentEnabled(cfg *config.Config) bool {
+	cc, ok := cfg.Components["dns"]
+	if !ok {
+		return true
+	}
+	enabled, ok := cc.Config["enabled"].(bool)
+	if !ok {
+		return true
+	}
+	return enabled
+}
+
 // validateDNSConfig performs DNS-specific validations
 func validateDNSConfig(cfg *config.Config) error {
 	if cfg.DNS == nil {
 		return fmt.Errorf("dns configuration is required")
+	}
+
+	// Zones describe what Foundry's DNS server will serve, so they are only
+	// required when it is running one. A stack that resolves names another way
+	// -- Tailscale MagicDNS, an upstream resolver, plain hostnames -- has none,
+	// and demanding them would only invite zones that describe a fiction.
+	if !dnsComponentEnabled(cfg) {
+		return nil
 	}
 
 	// DNS.Validate() is already called by cfg.Validate(), but we can add
