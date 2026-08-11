@@ -204,15 +204,17 @@ func ParseAdditionalRegistries(raw map[string]any) []AdditionalRegistry {
 }
 
 // Validate validates the K3s configuration
+//
+// An empty VIP is valid: a single control plane cluster deploys no kube-vip,
+// because a floating address with nothing to float between provides no
+// failover. When a VIP is configured, its format is still checked.
 func (c *Config) Validate() error {
-	if c.VIP == "" {
-		return fmt.Errorf("VIP is required")
-	}
-
-	// Dereference AllowCGNATVIP pointer (defaults to false if nil)
-	allowCGNAT := c.AllowCGNATVIP != nil && *c.AllowCGNATVIP
-	if err := ValidateVIP(c.VIP, allowCGNAT); err != nil {
-		return fmt.Errorf("VIP validation failed: %w", err)
+	if c.VIP != "" {
+		// Dereference AllowCGNATVIP pointer (defaults to false if nil)
+		allowCGNAT := c.AllowCGNATVIP != nil && *c.AllowCGNATVIP
+		if err := ValidateVIP(c.VIP, allowCGNAT); err != nil {
+			return fmt.Errorf("VIP validation failed: %w", err)
+		}
 	}
 	if c.NodeIP != "" && net.ParseIP(c.NodeIP) == nil {
 		return fmt.Errorf("node_ip must be an IP address")

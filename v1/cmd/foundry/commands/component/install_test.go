@@ -686,9 +686,34 @@ func TestBuildK3sNodeConfigSeparatesVIPAndNodeIP(t *testing.T) {
 		"legacy kube-vip Interface must not be populated from an address")
 	assert.Equal(t, "192.168.1.10", k3sConfig.NodeIP)
 	assert.Equal(t, "192.168.1.10", k3sConfig.AdvertiseAddress)
-	assert.Equal(t, "192.168.1.100", k3sConfig.VIP)
 	assert.NotEmpty(t, k3sConfig.RegistryConfig,
 		"a reachable Zot host should populate registries.yaml")
+
+	// One control plane host, so no kube-vip is deployed and the VIP must not
+	// reach the node config -- otherwise reconciling recreates the kube-vip
+	// that lets the VIP be selected as the Flannel endpoint.
+	require.Len(t, cfg.GetClusterControlPlaneHosts(), 1)
+	assert.Empty(t, k3sConfig.VIP,
+		"an undeployed VIP must not be carried into the node config")
+	assert.Contains(t, k3sConfig.TLSSANs, "192.168.1.100",
+		"the VIP stays a certificate SAN so a later second control plane needs no new certificate")
+}
+
+func TestBuildK3sNodeConfigKeepsVIPForMultipleControlPlanes(t *testing.T) {
+	cfg := k3sTestConfig()
+	cfg.Hosts = append(cfg.Hosts, &host.Host{
+		Hostname: "cp2",
+		Address:  "192.168.1.11",
+		NodeIP:   "192.168.1.11",
+		Roles:    []string{host.RoleClusterControlPlane},
+	})
+
+	k3sConfig, err := buildK3sNodeConfig(cfg, cfg.Hosts[0])
+	require.NoError(t, err)
+
+	// Two control planes give the VIP something to float between, so kube-vip
+	// is deployed for it.
+	assert.Equal(t, "192.168.1.100", k3sConfig.VIP)
 }
 
 func TestBuildK3sNodeConfigRejectsImplicitCGNATNodeIP(t *testing.T) {

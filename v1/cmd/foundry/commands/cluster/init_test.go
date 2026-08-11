@@ -22,7 +22,7 @@ func TestInitCommand(t *testing.T) {
 	assert.NotNil(t, cmd.Action)
 
 	// Check flags (--config is inherited from root command, not defined here)
-	assert.Len(t, cmd.Flags, 2)
+	assert.Len(t, cmd.Flags, 1)
 
 	var hasSingleNodeFlag, hasDryRunFlag bool
 	for _, flag := range cmd.Flags {
@@ -34,7 +34,10 @@ func TestInitCommand(t *testing.T) {
 		}
 	}
 
-	assert.True(t, hasSingleNodeFlag, "should have single-node flag")
+	// --single-node was removed: it truncated a local slice that
+	// InitializeCluster then discarded, so it never had any effect. A cluster
+	// with one control plane host is now described by the host list itself.
+	assert.False(t, hasSingleNodeFlag, "single-node flag should be gone")
 	assert.True(t, hasDryRunFlag, "should have dry-run flag")
 }
 
@@ -289,7 +292,7 @@ func TestRunClusterInit_NoNodes(t *testing.T) {
 	assert.Contains(t, err.Error(), "no hosts with cluster roles")
 }
 
-func TestRunClusterInit_SingleNodeFlag(t *testing.T) {
+func TestRunClusterInitRejectsRemovedSingleNodeFlag(t *testing.T) {
 	// Create a multi-node config
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "test-config.yaml")
@@ -334,13 +337,17 @@ func TestRunClusterInit_SingleNodeFlag(t *testing.T) {
 		},
 	}
 
-	// Run with single-node and dry-run flags
-	args := []string{"foundry", "cluster", "init", "--config", configPath, "--single-node", "--dry-run"}
-
 	ctx := context.Background()
-	err = app.Run(ctx, args)
 
-	// Should succeed and only show one node in dry-run output
+	// --single-node was removed: it truncated a local slice that
+	// InitializeCluster then re-derived from the config, so it never had any
+	// effect. Passing it must now be rejected rather than silently ignored.
+	err = app.Run(ctx, []string{"foundry", "cluster", "init", "--config", configPath, "--single-node", "--dry-run"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "single-node")
+
+	// The same cluster is described by its host list alone.
+	err = app.Run(ctx, []string{"foundry", "cluster", "init", "--config", configPath, "--dry-run"})
 	assert.NoError(t, err)
 }
 

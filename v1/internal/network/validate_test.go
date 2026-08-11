@@ -51,7 +51,10 @@ func TestValidateIPs(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "host IP outside network range",
+			// A host on another subnet is routable and exclusively its own, so
+			// it is valid. Subnet membership stopped being the test when the
+			// invariant became exclusive ownership.
+			name: "host IP outside network range is accepted",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -73,8 +76,7 @@ func TestValidateIPs(t *testing.T) {
 					"k3s": config.ComponentConfig{},
 				},
 			},
-			wantErr: true,
-			errMsg:  "outside network",
+			wantErr: false,
 		},
 		{
 			// A kube-vip VIP is a /32 carried as a secondary address on the LAN
@@ -140,7 +142,7 @@ func TestValidateIPs(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "one of multiple hosts outside network",
+			name: "hosts spread across two subnets are accepted",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -167,8 +169,7 @@ func TestValidateIPs(t *testing.T) {
 					"k3s": config.ComponentConfig{},
 				},
 			},
-			wantErr: true,
-			errMsg:  "outside network",
+			wantErr: false,
 		},
 		{
 			// node_ip is the LAN data-plane address; `address` is the
@@ -196,7 +197,10 @@ func TestValidateIPs(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "a node_ip outside the LAN subnet is still rejected",
+			// Subnet membership is not the invariant. A node_ip on another
+			// subnet is still exclusively the node's own, non-floating, and not
+			// an overlay address, so Flannel can use it.
+			name: "a node_ip outside the LAN subnet is accepted when exclusively owned",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -206,31 +210,7 @@ func TestValidateIPs(t *testing.T) {
 					{
 						Hostname: "blue1",
 						Address:  "100.81.89.62",
-						NodeIP:   "192.168.2.185", // wrong subnet
-						Roles:    []string{host.RoleClusterControlPlane},
-					},
-				},
-				Cluster: config.ClusterConfig{
-					Name: "test", PrimaryDomain: "example.com", VIP: "10.0.0.11",
-				},
-				Components: config.ComponentMap{"k3s": config.ComponentConfig{}},
-			},
-			wantErr: true,
-			errMsg:  "outside network",
-		},
-		{
-			// A CGNAT address with no node_ip cannot be checked against the LAN.
-			// K3sNodeIP() rejects this separately, with a better message.
-			name: "CGNAT address without node_ip is skipped here",
-			cfg: &config.Config{
-				Network: &config.NetworkConfig{
-					Gateway: "192.168.1.1",
-					Netmask: "255.255.255.0",
-				},
-				Hosts: []*host.Host{
-					{
-						Hostname: "blue1",
-						Address:  "100.81.89.62",
+						NodeIP:   "192.168.2.185", // another subnet, still owned
 						Roles:    []string{host.RoleClusterControlPlane},
 					},
 				},
@@ -240,6 +220,79 @@ func TestValidateIPs(t *testing.T) {
 				Components: config.ComponentMap{"k3s": config.ComponentConfig{}},
 			},
 			wantErr: false,
+		},
+		{
+			// A CGNAT address is an overlay address, so it cannot serve as the
+			// Flannel endpoint; K3sNodeIP supplies the message.
+			name: "CGNAT address without node_ip is rejected",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				Hosts: []*host.Host{
+					{
+						Hostname: "blue1",
+						Address:  "100.81.89.62",
+						Roles:    []string{host.RoleClusterControlPlane},
+					},
+				},
+				Cluster: config.ClusterConfig{
+					Name: "test", PrimaryDomain: "example.com", VIP: "10.0.0.11",
+				},
+				Components: config.ComponentMap{"k3s": config.ComponentConfig{}},
+			},
+			wantErr: true,
+			errMsg:  "100.64.0.0/10",
+		},
+		{
+			// The fault on blue1: node_ip set to the floating API VIP.
+			name: "node_ip equal to the API VIP is rejected",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				Hosts: []*host.Host{
+					{
+						Hostname: "blue1",
+						Address:  "192.168.1.185",
+						NodeIP:   "10.0.0.11",
+						Roles:    []string{host.RoleClusterControlPlane},
+					},
+				},
+				Cluster: config.ClusterConfig{
+					Name: "test", PrimaryDomain: "example.com", VIP: "10.0.0.11",
+				},
+				Components: config.ComponentMap{"k3s": config.ComponentConfig{}},
+			},
+			wantErr: true,
+			errMsg:  "is the API VIP",
+		},
+		{
+			name: "two hosts sharing a node_ip are rejected",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{
+					Gateway: "192.168.1.1",
+					Netmask: "255.255.255.0",
+				},
+				Hosts: []*host.Host{
+					{
+						Hostname: "blue1", Address: "192.168.1.185", NodeIP: "192.168.1.185",
+						Roles: []string{host.RoleClusterControlPlane},
+					},
+					{
+						Hostname: "blue2", Address: "192.168.1.97", NodeIP: "192.168.1.185",
+						Roles: []string{host.RoleClusterWorker},
+					},
+				},
+				Cluster: config.ClusterConfig{
+					Name: "test", PrimaryDomain: "example.com", VIP: "10.0.0.11",
+				},
+				Components: config.ComponentMap{"k3s": config.ComponentConfig{}},
+			},
+			wantErr: true,
+			errMsg:  "share node IP",
 		},
 		{
 			// The live topology: LAN nodes, a /32 VIP on another network, and

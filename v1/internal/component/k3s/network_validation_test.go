@@ -11,6 +11,11 @@ import (
 func TestResolveNodeNetworkWithSecondaryVIP(t *testing.T) {
 	exec := &mockInstallSSHExecutor{execFunc: func(command string) (*ssh.ExecResult, error) {
 		require.Contains(t, command, "ip -o -4 addr show")
+		// The VIP lives on a different interface here, so enp1s0 carries only
+		// the node address.
+		if strings.Contains(command, "dev enp1s0") {
+			return &ssh.ExecResult{ExitCode: 0, Stdout: "192.168.1.185/24\n"}, nil
+		}
 		return &ssh.ExecResult{ExitCode: 0, Stdout: "enp1s0\n"}, nil
 	}}
 	cfg := &Config{VIP: "10.0.0.11", NodeIP: "192.168.1.185"}
@@ -22,6 +27,42 @@ func TestResolveNodeNetworkWithSecondaryVIP(t *testing.T) {
 	require.Contains(t, content, "flannel-iface: enp1s0")
 	require.Contains(t, content, "advertise-address: 192.168.1.185")
 	require.NotContains(t, content, "10.0.0.11")
+}
+
+// TestResolveNodeNetworkRefusesVIPOnFlannelInterface covers the fault observed
+// on blue1: pinning Flannel by interface name is not enough when kube-vip has
+// added the VIP as a secondary address on that same interface, because K3s can
+// then resolve the name to the VIP.
+func TestResolveNodeNetworkRefusesVIPOnFlannelInterface(t *testing.T) {
+	exec := &mockInstallSSHExecutor{execFunc: func(command string) (*ssh.ExecResult, error) {
+		if strings.Contains(command, "dev enp1s0") {
+			// Both the node address and the VIP, exactly as on blue1.
+			return &ssh.ExecResult{ExitCode: 0, Stdout: "192.168.1.185/24\n10.0.0.11/32\n"}, nil
+		}
+		return &ssh.ExecResult{ExitCode: 0, Stdout: "enp1s0\n"}, nil
+	}}
+
+	cfg := &Config{VIP: "10.0.0.11", NodeIP: "192.168.1.185"}
+	err := ResolveNodeNetwork(exec, cfg)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "enp1s0")
+	require.ErrorContains(t, err, "10.0.0.11")
+	require.ErrorContains(t, err, "192.168.1.185")
+}
+
+// TestResolveNodeNetworkAllowsSharedInterfaceWithoutVIP is the same topology
+// with the VIP removed: nothing else about a shared interface is a problem.
+func TestResolveNodeNetworkAllowsSharedInterfaceWithoutVIP(t *testing.T) {
+	exec := &mockInstallSSHExecutor{execFunc: func(command string) (*ssh.ExecResult, error) {
+		if strings.Contains(command, "dev enp1s0") {
+			return &ssh.ExecResult{ExitCode: 0, Stdout: "192.168.1.185/24\n"}, nil
+		}
+		return &ssh.ExecResult{ExitCode: 0, Stdout: "enp1s0\n"}, nil
+	}}
+
+	cfg := &Config{NodeIP: "192.168.1.185"}
+	require.NoError(t, ResolveNodeNetwork(exec, cfg))
+	require.Equal(t, "enp1s0", cfg.FlannelIface)
 }
 
 func TestValidateFlannelPublicIPs(t *testing.T) {

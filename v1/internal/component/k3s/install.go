@@ -214,31 +214,38 @@ func InstallControlPlane(ctx context.Context, executor SSHExecutor, cfg *Config)
 			fmt.Println("   ✓ No config changes, skipping restart")
 		}
 
-		// Detect network interface for kube-vip if not provided
-		if cfg.Interface == "" {
-			iface, err := network.DetectPrimaryInterface(executor)
-			if err != nil {
-				return fmt.Errorf("failed to detect network interface: %w", err)
+		if cfg.VIP != "" {
+			// Detect network interface for kube-vip if not provided
+			if cfg.Interface == "" {
+				iface, err := network.DetectPrimaryInterface(executor)
+				if err != nil {
+					return fmt.Errorf("failed to detect network interface: %w", err)
+				}
+				cfg.Interface = iface
 			}
-			cfg.Interface = iface
-		}
 
-		// Apply kube-vip manifests (idempotent via kubectl apply)
-		// This updates RBAC, ConfigMaps, and other resources
-		if err := setupKubeVIP(ctx, executor, cfg); err != nil {
-			return fmt.Errorf("failed to update kube-vip: %w", err)
-		}
+			// Apply kube-vip manifests (idempotent via kubectl apply)
+			// This updates RBAC, ConfigMaps, and other resources
+			if err := setupKubeVIP(ctx, executor, cfg); err != nil {
+				return fmt.Errorf("failed to update kube-vip: %w", err)
+			}
 
-		// Note: kube-vip-cloud-provider restart is no longer done automatically
-		// as it causes unnecessary VIP disruption. The deployment is idempotent
-		// via kubectl apply, and config changes are picked up on pod restart.
+			// Note: kube-vip-cloud-provider restart is no longer done automatically
+			// as it causes unnecessary VIP disruption. The deployment is idempotent
+			// via kubectl apply, and config changes are picked up on pod restart.
+		} else if err := reportStaleKubeVIP(executor, cfg); err != nil {
+			return err
+		}
 
 		fmt.Println("   ✓ Updates applied successfully")
 		return nil
 	}
 
-	// Detect network interface if not provided
-	if cfg.Interface == "" {
+	// Detect network interface if not provided. Only kube-vip needs it, and the
+	// detection picks the default-route interface -- the same one Flannel binds
+	// to -- so skipping it when no VIP is deployed also removes the pairing that
+	// lets the VIP be selected as the Flannel endpoint.
+	if cfg.VIP != "" && cfg.Interface == "" {
 		iface, err := network.DetectPrimaryInterface(executor)
 		if err != nil {
 			return fmt.Errorf("failed to detect network interface: %w", err)
@@ -279,17 +286,73 @@ func InstallControlPlane(ctx context.Context, executor SSHExecutor, cfg *Config)
 		return fmt.Errorf("K3s failed to become ready: %w", err)
 	}
 
-	// Step 5: Set up kube-vip
-	if err := setupKubeVIP(ctx, executor, cfg); err != nil {
-		return fmt.Errorf("failed to setup kube-vip: %w", err)
+	// Steps 5 and 6: Set up kube-vip and wait for it, when this cluster has a
+	// VIP to deploy. A single control plane cluster does not: see
+	// config.VIPEnabled, which is what leaves cfg.VIP empty here.
+	if cfg.VIP != "" {
+		if err := setupKubeVIP(ctx, executor, cfg); err != nil {
+			return fmt.Errorf("failed to setup kube-vip: %w", err)
+		}
+
+		if err := waitForKubeVIPReady(executor, cfg.VIP, DefaultRetryConfig()); err != nil {
+			return fmt.Errorf("kube-vip failed to become ready: %w", err)
+		}
+
+		return nil
 	}
 
-	// Step 6: Wait for kube-vip to be ready
-	if err := waitForKubeVIPReady(executor, cfg.VIP, DefaultRetryConfig()); err != nil {
-		return fmt.Errorf("kube-vip failed to become ready: %w", err)
+	return reportStaleKubeVIP(executor, cfg)
+}
+
+// reportStaleKubeVIP warns when kube-vip is deployed on a cluster that no
+// longer wants a VIP, and returns without changing anything.
+//
+// Removing it is deliberately not done here: tearing down a DaemonSet as a side
+// effect of an install command is not something an operator can review at the
+// point of use. `foundry stack doctor --fix` removes it explicitly instead.
+func reportStaleKubeVIP(executor SSHExecutor, cfg *Config) error {
+	installed, err := IsKubeVIPInstalled(executor)
+	if err != nil {
+		// Not being able to tell is not a reason to fail the install; the VIP
+		// is already not being deployed.
+		return nil
+	}
+	if !installed {
+		return nil
 	}
 
+	fmt.Println(StaleKubeVIPNotice(cfg.VIP, cfg.FlannelIface))
 	return nil
+}
+
+// StaleKubeVIPNotice explains a kube-vip deployment that Foundry no longer
+// manages, and how to remove it by hand.
+//
+// vip and iface may be empty when the configured VIP has already been dropped
+// from stack.yaml; the message stays accurate without them.
+func StaleKubeVIPNotice(vip, iface string) string {
+	vipDesc := "the API VIP"
+	if vip != "" {
+		vipDesc = fmt.Sprintf("the API VIP %s", vip)
+	}
+	ifaceDesc := "the Flannel interface"
+	if iface != "" {
+		ifaceDesc = iface
+	}
+
+	return fmt.Sprintf(`
+! kube-vip is deployed but this cluster has one control plane host, so %s
+  provides no failover and can be selected as the Flannel VXLAN endpoint --
+  which sends pod traffic to an address that belongs to the API server role
+  rather than to a specific node.
+
+  Foundry no longer deploys or updates kube-vip here. To remove it, run on the
+  control plane:
+
+      sudo k3s kubectl delete daemonset -n kube-system kube-vip
+
+  then confirm 'ip addr show %s' no longer lists it and restart k3s so Flannel
+  re-selects the node address. See docs/network-planes.md.`, vipDesc, ifaceDesc)
 }
 
 func updateNetworkConfig(executor SSHExecutor, cfg *Config, server bool) (bool, error) {

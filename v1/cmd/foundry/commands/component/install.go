@@ -964,8 +964,8 @@ func isSecretRef(value string) bool {
 
 // kubeconfigClientEndpoint returns the address remote clients should use to
 // reach the API server, derived from the first control plane host. Returns ""
-// when there is no cluster to point at, or when neither a Tailscale address nor
-// a VIP is configured.
+// when there is no cluster to point at, or when the host has no Tailscale
+// address, no VIP, and no usable node address.
 func kubeconfigClientEndpoint(stackConfig *config.Config) string {
 	if stackConfig == nil {
 		return ""
@@ -974,7 +974,10 @@ func kubeconfigClientEndpoint(stackConfig *config.Config) string {
 	if len(cpHosts) == 0 {
 		return ""
 	}
-	return k3s.ClientEndpoint(cpHosts[0].TailscaleAddress, stackConfig.Cluster.VIP)
+	// A host with no usable data plane address is reported by validation; here
+	// it simply contributes no fallback.
+	nodeIP, _ := cpHosts[0].K3sNodeIP()
+	return k3s.ClientEndpoint(cpHosts[0].TailscaleAddress, stackConfig.Cluster.VIP, nodeIP)
 }
 
 // reconcileKubeconfigEndpoint re-points the stored kubeconfig at the address
@@ -1126,9 +1129,17 @@ func buildK3sNodeConfig(stackConfig *config.Config, h *host.Host) (*k3s.Config, 
 	if err != nil {
 		return nil, err
 	}
+	// The VIP is only carried into the node config when kube-vip is actually
+	// deployed for it. A configured-but-undeployed VIP stays out, so a single
+	// control plane cluster does not recreate kube-vip on reconcile; it is still
+	// added to the certificate SANs from stackConfig.Cluster.VIP below.
 	k3sConfig := &k3s.Config{
-		VIP:    stackConfig.Cluster.VIP,
 		NodeIP: nodeIP,
+	}
+	if stackConfig.VIPEnabled() {
+		k3sConfig.VIP = stackConfig.Cluster.VIP
+	} else if stackConfig.Cluster.VIP != "" {
+		k3sConfig.TLSSANs = append(k3sConfig.TLSSANs, stackConfig.Cluster.VIP)
 	}
 	k3sConfig.FlannelIface = h.FlannelInterface
 	k3sConfig.AdvertiseAddress = k3sConfig.NodeIP
@@ -1324,10 +1335,15 @@ func registerComponentDNS(ctx context.Context, componentName string, stackConfig
 			return fmt.Errorf("no Zot host configured: %w", err)
 		}
 	case "k8s":
-		if stackConfig.Cluster.VIP == "" {
-			return fmt.Errorf("no K8s VIP configured")
+		// The API is reached at the VIP when one is deployed, and at the control
+		// plane node's own address otherwise.
+		ip, err = stackConfig.APIEndpoint()
+		if err != nil {
+			return fmt.Errorf("no K8s API endpoint configured: %w", err)
 		}
-		ip = stackConfig.Cluster.VIP
+		if ip == "" {
+			return fmt.Errorf("no K8s API endpoint configured: no control plane host is defined")
+		}
 	default:
 		return fmt.Errorf("unknown component: %s", componentName)
 	}

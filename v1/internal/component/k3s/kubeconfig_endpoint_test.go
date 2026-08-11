@@ -44,41 +44,55 @@ users:
 }
 
 func TestClientEndpoint(t *testing.T) {
+	const testNodeIP = "192.168.1.185"
+
 	tests := []struct {
 		name             string
 		tailscaleAddress string
 		vip              string
+		nodeIP           string
 		want             string
 	}{
 		{
 			name:             "tailscale address wins over VIP",
 			tailscaleAddress: testTailscaleAddress,
 			vip:              testVIP,
+			nodeIP:           testNodeIP,
 			want:             testTailscaleAddress,
 		},
 		{
 			name:             "falls back to VIP when no tailscale address",
 			tailscaleAddress: "",
 			vip:              testVIP,
+			nodeIP:           testNodeIP,
 			want:             testVIP,
 		},
 		{
 			name:             "tailscale address used even with no VIP",
 			tailscaleAddress: testTailscaleAddress,
 			vip:              "",
+			nodeIP:           testNodeIP,
 			want:             testTailscaleAddress,
 		},
 		{
-			name:             "empty when neither configured",
+			name:             "falls back to the node address for a VIP-less cluster",
 			tailscaleAddress: "",
 			vip:              "",
+			nodeIP:           testNodeIP,
+			want:             testNodeIP,
+		},
+		{
+			name:             "empty when nothing is configured",
+			tailscaleAddress: "",
+			vip:              "",
+			nodeIP:           "",
 			want:             "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, ClientEndpoint(tt.tailscaleAddress, tt.vip))
+			assert.Equal(t, tt.want, ClientEndpoint(tt.tailscaleAddress, tt.vip, tt.nodeIP))
 		})
 	}
 }
@@ -382,7 +396,7 @@ func TestRetrieveAndStoreKubeconfigUsesClientEndpoint(t *testing.T) {
 				},
 			}
 
-			endpoint := ClientEndpoint(tt.tailscaleAddress, testVIP)
+			endpoint := ClientEndpoint(tt.tailscaleAddress, testVIP, "")
 			require.NoError(t, RetrieveAndStoreKubeconfig(context.Background(), executor, client, endpoint))
 			assert.Contains(t, stored, tt.wantServer)
 			assert.NotContains(t, stored, "127.0.0.1")

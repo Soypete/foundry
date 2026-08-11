@@ -276,7 +276,10 @@ func TestValidateNetworkConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "IP not on same network",
+			// Subnet membership is no longer the test: an address on another
+			// network is still exclusively this host's own. See
+			// network.ValidateFlannelEndpoints.
+			name: "IP not on same network is accepted",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{
 					Gateway: "192.168.1.1",
@@ -290,8 +293,7 @@ func TestValidateNetworkConfig(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
-			errMsg:  "outside network",
+			wantErr: false,
 		},
 		{
 			name: "DHCP conflict",
@@ -463,12 +465,28 @@ func TestValidateVIPConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "missing VIP",
+			// One control plane host needs no VIP: a floating address with
+			// nothing to float between provides no failover.
+			name: "missing VIP is allowed for a single control plane",
 			cfg: &config.Config{
 				Network: &config.NetworkConfig{},
+				Hosts: []*host.Host{
+					{Hostname: "blue1", Address: "192.168.1.185", Roles: []string{host.RoleClusterControlPlane}},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "missing VIP is rejected for multiple control planes",
+			cfg: &config.Config{
+				Network: &config.NetworkConfig{},
+				Hosts: []*host.Host{
+					{Hostname: "blue1", Address: "192.168.1.185", Roles: []string{host.RoleClusterControlPlane}},
+					{Hostname: "blue2", Address: "192.168.1.97", Roles: []string{host.RoleClusterControlPlane}},
+				},
 			},
 			wantErr: true,
-			errMsg:  "vip is required",
+			errMsg:  "cluster.vip is required for a multi-control-plane cluster",
 		},
 		{
 			name: "nil network config",

@@ -157,9 +157,12 @@ func validateVIPConfig(cfg *config.Config) error {
 	// VIP is already validated in Network.Validate() and validateK8sVIPUniqueness()
 	// but we can add additional checks here
 
-	// Ensure VIP is set
-	if cfg.Cluster.VIP == "" {
-		return fmt.Errorf("cluster.vip is required")
+	// A VIP is a floating address kube-vip moves between control plane nodes, so
+	// it is only required when there is more than one of them. A single control
+	// plane needs none: see config.VIPEnabled.
+	if cfg.Cluster.VIP == "" && len(cfg.GetClusterControlPlaneHosts()) > 1 {
+		return fmt.Errorf("cluster.vip is required for a multi-control-plane cluster: %d control plane hosts need a floating API endpoint",
+			len(cfg.GetClusterControlPlaneHosts()))
 	}
 
 	return nil
@@ -232,7 +235,22 @@ func collectConfigWarnings(cfg *config.Config) []string {
 	var warnings []string
 	warnings = append(warnings, warnMissingControlPlaneTailscaleAddress(cfg)...)
 	warnings = append(warnings, warnMissingTailscaleCredentials(cfg)...)
+	warnings = append(warnings, warnUndeployedVIP(cfg)...)
 	return warnings
+}
+
+// warnUndeployedVIP reports a cluster.vip that Foundry will not deploy because
+// the cluster has a single control plane host.
+func warnUndeployedVIP(cfg *config.Config) []string {
+	if cfg == nil || cfg.Cluster.VIP == "" || cfg.VIPEnabled() {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"cluster.vip %s is set but this cluster has one control plane host. Foundry will not "+
+			"deploy kube-vip for it: a single-node VIP adds no failover, and it can be selected "+
+			"as the Flannel VXLAN endpoint. Remove cluster.vip, or add a second "+
+			"cluster-control-plane host. It is still added to the API certificate SANs.",
+		cfg.Cluster.VIP)}
 }
 
 // warnMissingControlPlaneTailscaleAddress flags control plane hosts with no

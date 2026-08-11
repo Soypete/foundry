@@ -168,9 +168,14 @@ func TestWarnMissingControlPlaneTailscaleAddressExcludesHealthyHosts(t *testing.
 
 func TestCollectConfigWarnings(t *testing.T) {
 	t.Run("surfaces the missing tailscale address warning", func(t *testing.T) {
+		// Two control planes, so the VIP is deployed and does not warn on its
+		// own; the tailscale address warning is the one under test.
 		cfg := &config.Config{
 			Cluster: config.ClusterConfig{VIP: warnVIP},
-			Hosts:   []*host.Host{controlPlaneHost("blue1", "192.168.1.185", "")},
+			Hosts: []*host.Host{
+				controlPlaneHost("blue1", "192.168.1.185", ""),
+				controlPlaneHost("blue2", "192.168.1.97", warnTailscale2),
+			},
 		}
 		warnings := collectConfigWarnings(cfg)
 		require.Len(t, warnings, 1)
@@ -180,7 +185,30 @@ func TestCollectConfigWarnings(t *testing.T) {
 	t.Run("returns nothing for a fully configured stack", func(t *testing.T) {
 		cfg := &config.Config{
 			Cluster: config.ClusterConfig{VIP: warnVIP},
+			Hosts: []*host.Host{
+				controlPlaneHost("blue1", "192.168.1.185", warnTailscale1),
+				controlPlaneHost("blue2", "192.168.1.97", warnTailscale2),
+			},
+		}
+		assert.Empty(t, collectConfigWarnings(cfg))
+	})
+
+	t.Run("warns about a VIP that will not be deployed", func(t *testing.T) {
+		// blue1's situation: one control plane host with a VIP still in
+		// stack.yaml. Foundry stops deploying kube-vip for it, and says so.
+		cfg := &config.Config{
+			Cluster: config.ClusterConfig{VIP: warnVIP},
 			Hosts:   []*host.Host{controlPlaneHost("blue1", "192.168.1.185", warnTailscale1)},
+		}
+		warnings := collectConfigWarnings(cfg)
+		require.Len(t, warnings, 1)
+		assert.Contains(t, warnings[0], warnVIP)
+		assert.Contains(t, warnings[0], "one control plane host")
+	})
+
+	t.Run("does not warn when no VIP is configured", func(t *testing.T) {
+		cfg := &config.Config{
+			Hosts: []*host.Host{controlPlaneHost("blue1", "192.168.1.185", warnTailscale1)},
 		}
 		assert.Empty(t, collectConfigWarnings(cfg))
 	})

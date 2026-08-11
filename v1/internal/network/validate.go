@@ -19,42 +19,72 @@ func ValidateIPs(fullCfg *config.Config) error {
 	// Gateway and netmask are already validated by config.Validate()
 	// But we can do additional checks here
 
-	// Validate that gateway is on the same network as other IPs
-	network, err := GetNetworkCIDR(cfg.Gateway, cfg.Netmask)
-	if err != nil {
+	// Validate that the gateway and netmask describe a usable network. The
+	// result is not used to constrain host addresses; see
+	// ValidateFlannelEndpoints for what actually governs them.
+	if _, err := GetNetworkCIDR(cfg.Gateway, cfg.Netmask); err != nil {
 		return fmt.Errorf("failed to calculate network CIDR: %w", err)
 	}
 
-	// Only addresses that belong to the LAN data plane are checked against the
-	// LAN subnet. Other planes legitimately live elsewhere:
-	//
-	//   - The API VIP is commonly a /32 that kube-vip carries as a secondary
-	//     address on the LAN interface without being a member of the LAN subnet.
-	//   - A host's `address` is the SSH/management address, which is a CGNAT
-	//     100.64.0.0/10 address when nodes are reached over Tailscale.
-	//   - `tailscale_address` is never on the LAN by definition.
-	//
-	// See docs/network-planes.md. Each host's LAN address is its `node_ip`,
-	// defaulting to `address` when that is itself a LAN IP.
+	return ValidateFlannelEndpoints(fullCfg)
+}
+
+// ValidateFlannelEndpoints checks that every host has an address Flannel can
+// safely use as its VXLAN endpoint.
+//
+// The requirement is not that the address belongs to the LAN subnet. Subnet
+// membership was only ever a proxy for the real property, and it rejects
+// legitimate topologies such as a routed /32 or a second subnet. What Flannel
+// actually needs is an address that:
+//
+//   - the node exclusively owns, so peers reach that node and no other;
+//   - does not float, so it cannot move to a different machine; and
+//   - is not an overlay address, so pod traffic is not encapsulated twice and
+//     does not depend on the overlay being up.
+//
+// The API VIP fails the second test: kube-vip moves it between control plane
+// nodes, so a peer sending pod traffic there follows the API server role rather
+// than the node. A CGNAT address fails the third. See docs/network-planes.md.
+func ValidateFlannelEndpoints(fullCfg *config.Config) error {
+	if fullCfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+
+	vip := fullCfg.Cluster.VIP
+	seen := make(map[string]string, len(fullCfg.Hosts))
+
 	for _, h := range fullCfg.Hosts {
-		lanAddr := h.NodeIP
-		if lanAddr == "" {
-			// Without an explicit node_ip, `address` doubles as the LAN
-			// address — but only when it is not an overlay address.
-			if h.Address == "" || isCGNAT(h.Address) {
+		// K3sNodeIP applies the CGNAT guard and reports why an address is not
+		// usable, so the rule lives in one place.
+		nodeIP, err := h.K3sNodeIP()
+		if err != nil {
+			// A host with no address at all is not necessarily a cluster
+			// member; only a stated-but-unusable address is an error here.
+			if h.Address == "" && h.NodeIP == "" {
 				continue
 			}
-			lanAddr = h.Address
+			return fmt.Errorf("host %s: %w", h.Hostname, err)
+		}
+		if nodeIP == "" {
+			continue
 		}
 
-		ip := net.ParseIP(lanAddr)
-		if ip == nil {
-			return fmt.Errorf("invalid IP address for host %s: %s", h.Hostname, lanAddr)
+		if net.ParseIP(nodeIP) == nil {
+			return fmt.Errorf("invalid IP address for host %s: %s", h.Hostname, nodeIP)
 		}
-		if !network.Contains(ip) {
-			return fmt.Errorf("host %s has node IP %s outside network %s",
-				h.Hostname, lanAddr, network.String())
+		if vip != "" && nodeIP == vip {
+			return fmt.Errorf("host %s node IP %s is the API VIP; Flannel's endpoint must be an address the node exclusively owns, not a floating address that moves between control plane nodes",
+				h.Hostname, nodeIP)
 		}
+		if isCGNAT(nodeIP) {
+			return fmt.Errorf("host %s node IP %s is in the Tailscale/CGNAT range 100.64.0.0/10; Flannel's endpoint must be a physical address, not an overlay one",
+				h.Hostname, nodeIP)
+		}
+		if other, dup := seen[nodeIP]; dup {
+			return fmt.Errorf("hosts %s and %s share node IP %s; each node's Flannel endpoint must be exclusively its own",
+				other, h.Hostname, nodeIP)
+		}
+		seen[nodeIP] = h.Hostname
 	}
 
 	return nil

@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/catalystcommunity/foundry/v1/internal/host"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetHostsByRole(t *testing.T) {
@@ -137,4 +139,97 @@ func TestGetHostAddresses(t *testing.T) {
 			t.Errorf("Unexpected address: %s", addr)
 		}
 	}
+}
+
+func TestVIPEnabled(t *testing.T) {
+	cpHost := func(name, addr string) *host.Host {
+		return &host.Host{Hostname: name, Address: addr, NodeIP: addr, Roles: []string{host.RoleClusterControlPlane}}
+	}
+
+	tests := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{
+			// blue1: a VIP is configured, but with one control plane it has
+			// nothing to float between, so kube-vip is not deployed for it.
+			name: "single control plane with a VIP",
+			cfg: &Config{
+				Cluster: ClusterConfig{VIP: "10.0.0.11"},
+				Hosts:   []*host.Host{cpHost("blue1", "192.168.1.185")},
+			},
+			want: false,
+		},
+		{
+			name: "two control planes with a VIP",
+			cfg: &Config{
+				Cluster: ClusterConfig{VIP: "10.0.0.11"},
+				Hosts:   []*host.Host{cpHost("blue1", "192.168.1.185"), cpHost("blue2", "192.168.1.97")},
+			},
+			want: true,
+		},
+		{
+			name: "two control planes without a VIP",
+			cfg: &Config{
+				Hosts: []*host.Host{cpHost("blue1", "192.168.1.185"), cpHost("blue2", "192.168.1.97")},
+			},
+			want: false,
+		},
+		{
+			name: "no hosts",
+			cfg:  &Config{Cluster: ClusterConfig{VIP: "10.0.0.11"}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.cfg.VIPEnabled())
+		})
+	}
+}
+
+func TestAPIEndpoint(t *testing.T) {
+	cpHost := func(name, addr string) *host.Host {
+		return &host.Host{Hostname: name, Address: addr, NodeIP: addr, Roles: []string{host.RoleClusterControlPlane}}
+	}
+
+	t.Run("uses the VIP when it is deployed", func(t *testing.T) {
+		cfg := &Config{
+			Cluster: ClusterConfig{VIP: "10.0.0.11"},
+			Hosts:   []*host.Host{cpHost("blue1", "192.168.1.185"), cpHost("blue2", "192.168.1.97")},
+		}
+		endpoint, err := cfg.APIEndpoint()
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.11", endpoint)
+	})
+
+	t.Run("uses the control plane address when the VIP is not deployed", func(t *testing.T) {
+		cfg := &Config{
+			Cluster: ClusterConfig{VIP: "10.0.0.11"},
+			Hosts:   []*host.Host{cpHost("blue1", "192.168.1.185")},
+		}
+		endpoint, err := cfg.APIEndpoint()
+		require.NoError(t, err)
+		assert.Equal(t, "192.168.1.185", endpoint)
+	})
+
+	t.Run("is empty when there is no cluster", func(t *testing.T) {
+		endpoint, err := (&Config{}).APIEndpoint()
+		require.NoError(t, err)
+		assert.Empty(t, endpoint)
+	})
+
+	t.Run("errors when the control plane has only a CGNAT address", func(t *testing.T) {
+		cfg := &Config{
+			Hosts: []*host.Host{{
+				Hostname: "blue1", Address: "100.81.89.62",
+				Roles: []string{host.RoleClusterControlPlane},
+			}},
+		}
+		_, err := cfg.APIEndpoint()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "100.64.0.0/10")
+	})
 }

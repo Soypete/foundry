@@ -14,7 +14,7 @@ func ResolveNodeNetwork(executor SSHExecutor, cfg *Config) error {
 	if cfg.NodeIP == "" {
 		return fmt.Errorf("node_ip is required; refusing K3s address auto-detection")
 	}
-	if cfg.NodeIP == cfg.VIP {
+	if cfg.VIP != "" && cfg.NodeIP == cfg.VIP {
 		return fmt.Errorf("node_ip %s equals API VIP", cfg.NodeIP)
 	}
 	if cfg.FlannelIface == "" {
@@ -24,8 +24,46 @@ func ResolveNodeNetwork(executor SSHExecutor, cfg *Config) error {
 		}
 		cfg.FlannelIface = iface
 	}
+	if err := refuseVIPOnFlannelInterface(executor, cfg); err != nil {
+		return err
+	}
 	if cfg.AdvertiseAddress == "" {
 		cfg.AdvertiseAddress = cfg.NodeIP
+	}
+	return nil
+}
+
+// refuseVIPOnFlannelInterface fails when the interface Flannel is pinned to also
+// carries the API VIP.
+//
+// Pinning Flannel by interface name is not enough on its own. kube-vip adds the
+// VIP as a secondary address on the same NIC that owns the node address, and
+// K3s then resolves that interface name to whichever address it picks -- which
+// can be the VIP. Peers are then told to send this node's pod traffic to a
+// floating address that belongs to the API server role rather than to this
+// node, and it silently follows the VIP wherever it moves.
+func refuseVIPOnFlannelInterface(executor SSHExecutor, cfg *Config) error {
+	if cfg.VIP == "" || cfg.FlannelIface == "" {
+		return nil
+	}
+
+	addrs, err := network.InterfaceAddresses(executor, cfg.FlannelIface)
+	if err != nil {
+		// The address list is a cross-check, not the source of truth for the
+		// interface; a host that cannot report it is not a reason to refuse to
+		// converge.
+		return nil
+	}
+
+	for _, addr := range addrs {
+		if addr == cfg.VIP {
+			return fmt.Errorf(
+				"interface %s carries both the node address %s and the API VIP %s, "+
+					"so Flannel can select the VIP as its VXLAN endpoint and send pod "+
+					"traffic to an address that moves between control plane nodes; "+
+					"remove the VIP from this cluster or give kube-vip its own interface",
+				cfg.FlannelIface, cfg.NodeIP, cfg.VIP)
+		}
 	}
 	return nil
 }
@@ -186,8 +224,12 @@ func GenerateK3sServerFlags(cfg *Config) []string {
 		}
 	}
 
-	// Always add the VIP as a TLS SAN
-	flags = append(flags, fmt.Sprintf("--tls-san %s", cfg.VIP))
+	// Add the VIP as a TLS SAN whenever one is configured, even if kube-vip is
+	// not deployed for it: a SAN costs nothing and keeps the certificate valid
+	// if the cluster later grows a second control plane and starts using it.
+	if cfg.VIP != "" {
+		flags = append(flags, fmt.Sprintf("--tls-san %s", cfg.VIP))
+	}
 
 	if cfg.NodeIP != "" {
 		flags = append(flags, fmt.Sprintf("--node-ip %s", cfg.NodeIP))
