@@ -123,6 +123,25 @@ equals the API VIP, or fails the peer reachability check.
 5. If credentials were exposed, rotate them as described below before taking
    a new datastore backup.
 
+### Diagnosing a running cluster
+
+`foundry stack status` reports whether each component is installed and healthy.
+That is inventory: a cluster can show every component green while pod traffic is
+mis-routed, because the fault is in how components interact.
+
+`foundry stack doctor` asks the other question — whether the cluster is coherent:
+
+```
+foundry stack doctor          # read-only; exits non-zero on findings
+foundry stack doctor --fix    # applies the repairs it can
+```
+
+It checks that no node advertises the VIP or an address it does not own, that no
+Flannel interface carries the VIP alongside the node address, that no kube-vip
+is left running on a single-control-plane cluster, and that no Service still
+publishes a withdrawn VIP in `externalIPs`. Without `--fix` it changes nothing,
+so it is safe to run against a cluster someone else is working on.
+
 ### Removing a kube-vip Foundry no longer manages
 
 A cluster provisioned before single-control-plane VIPs were dropped still has
