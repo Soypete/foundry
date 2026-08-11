@@ -968,3 +968,53 @@ func TestValidateNetworkSubstrate(t *testing.T) {
 		assert.Contains(t, err.Error(), "tailscale_address")
 	})
 }
+
+// TestValidateDNSConfigRespectsEnabled covers a validator that demanded zones
+// for a component the operator had turned off. DNS is opt-out, so only an
+// explicit enabled: false skips the check -- a config that never mentions
+// `enabled` is still running DNS and must still be validated.
+func TestValidateDNSConfigRespectsEnabled(t *testing.T) {
+	emptyZones := func(components config.ComponentMap) *config.Config {
+		return &config.Config{
+			DNS: &config.DNSConfig{
+				InfrastructureZones: []config.DNSZone{},
+				KubernetesZones:     []config.DNSZone{},
+			},
+			Components: components,
+		}
+	}
+
+	t.Run("zones are required when dns is not mentioned", func(t *testing.T) {
+		err := validateDNSConfig(emptyZones(config.ComponentMap{}))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "infrastructure zone")
+	})
+
+	t.Run("zones are required when dns has no enabled key", func(t *testing.T) {
+		err := validateDNSConfig(emptyZones(config.ComponentMap{
+			"dns": {Config: map[string]any{"installed": true}},
+		}))
+		require.Error(t, err)
+	})
+
+	t.Run("zones are required when dns is explicitly enabled", func(t *testing.T) {
+		err := validateDNSConfig(emptyZones(config.ComponentMap{
+			"dns": {Config: map[string]any{"enabled": true}},
+		}))
+		require.Error(t, err)
+	})
+
+	t.Run("zones are not required when dns is disabled", func(t *testing.T) {
+		require.NoError(t, validateDNSConfig(emptyZones(config.ComponentMap{
+			"dns": {Config: map[string]any{"enabled": false}},
+		})))
+	})
+
+	t.Run("a nil dns block is still an error", func(t *testing.T) {
+		err := validateDNSConfig(&config.Config{
+			Components: config.ComponentMap{"dns": {Config: map[string]any{"enabled": false}}},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dns configuration is required")
+	})
+}
