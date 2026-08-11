@@ -972,3 +972,55 @@ func (m *mockSSHExecutor) Exec(command string) (*ssh.ExecResult, error) {
 
 	return nil, fmt.Errorf("no mock result configured for command: %s", command)
 }
+
+// TestValidateFlannelEndpointsRespectsSubstrate covers a bug found by running
+// the real config: ValidateFlannelEndpoints applied the LAN address rules
+// unconditionally, so a legitimate tailscale-substrate cluster was rejected by
+// the CGNAT guard before the substrate check ever ran.
+func TestValidateFlannelEndpointsRespectsSubstrate(t *testing.T) {
+	tailnetCluster := func() *config.Config {
+		return &config.Config{
+			Cluster: config.ClusterConfig{
+				Name: "test", PrimaryDomain: "local",
+				VIP: "10.0.0.11", NetworkSubstrate: "tailscale",
+			},
+			Hosts: []*host.Host{
+				{Hostname: "blue1", Address: "100.81.89.62", TailscaleAddress: "100.81.89.62",
+					Roles: []string{host.RoleClusterControlPlane}},
+				{Hostname: "blue2", Address: "100.125.196.1", TailscaleAddress: "100.125.196.1",
+					Roles: []string{host.RoleClusterWorker}},
+			},
+		}
+	}
+
+	t.Run("tailnet addresses are accepted on the tailscale substrate", func(t *testing.T) {
+		require.NoError(t, ValidateFlannelEndpoints(tailnetCluster()))
+	})
+
+	t.Run("the same hosts are rejected on the LAN substrate", func(t *testing.T) {
+		cfg := tailnetCluster()
+		cfg.Cluster.NetworkSubstrate = ""
+		err := ValidateFlannelEndpoints(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "100.64.0.0/10")
+	})
+
+	t.Run("an explicit CGNAT node_ip on the LAN points at the substrate switch", func(t *testing.T) {
+		cfg := tailnetCluster()
+		cfg.Cluster.NetworkSubstrate = ""
+		for _, h := range cfg.Hosts {
+			h.NodeIP = h.TailscaleAddress
+		}
+		err := ValidateFlannelEndpoints(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "network_substrate")
+	})
+
+	t.Run("a host missing its tailnet address is named", func(t *testing.T) {
+		cfg := tailnetCluster()
+		cfg.Hosts[1].TailscaleAddress = ""
+		err := ValidateFlannelEndpoints(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "blue2")
+	})
+}

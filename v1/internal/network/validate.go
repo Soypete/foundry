@@ -44,23 +44,31 @@ func ValidateIPs(fullCfg *config.Config) error {
 //
 // The API VIP fails the second test: kube-vip moves it between control plane
 // nodes, so a peer sending pod traffic there follows the API server role rather
-// than the node. A CGNAT address fails the third. See docs/network-planes.md.
+// than the node. On the LAN a CGNAT address fails the third; when the tailnet is
+// the chosen substrate it is required instead, which is why the address is
+// resolved through the substrate rather than assuming the LAN rules.
+// See docs/network-planes.md.
 func ValidateFlannelEndpoints(fullCfg *config.Config) error {
 	if fullCfg == nil {
 		return fmt.Errorf("config is nil")
+	}
+
+	substrate, err := NewSubstrate(fullCfg.Cluster.NetworkSubstrate)
+	if err != nil {
+		return err
 	}
 
 	vip := fullCfg.Cluster.VIP
 	seen := make(map[string]string, len(fullCfg.Hosts))
 
 	for _, h := range fullCfg.Hosts {
-		// K3sNodeIP applies the CGNAT guard and reports why an address is not
-		// usable, so the rule lives in one place.
-		nodeIP, err := h.K3sNodeIP()
+		// The substrate carries the address rules, including which of CGNAT or
+		// LAN is required, so they live in one place.
+		nodeIP, err := substrate.NodeAddress(h)
 		if err != nil {
 			// A host with no address at all is not necessarily a cluster
 			// member; only a stated-but-unusable address is an error here.
-			if h.Address == "" && h.NodeIP == "" {
+			if h.Address == "" && h.NodeIP == "" && h.TailscaleAddress == "" {
 				continue
 			}
 			return fmt.Errorf("host %s: %w", h.Hostname, err)
@@ -76,9 +84,11 @@ func ValidateFlannelEndpoints(fullCfg *config.Config) error {
 			return fmt.Errorf("host %s node IP %s is the API VIP; Flannel's endpoint must be an address the node exclusively owns, not a floating address that moves between control plane nodes",
 				h.Hostname, nodeIP)
 		}
-		if isCGNAT(nodeIP) {
-			return fmt.Errorf("host %s node IP %s is in the Tailscale/CGNAT range 100.64.0.0/10; Flannel's endpoint must be a physical address, not an overlay one",
-				h.Hostname, nodeIP)
+		// An overlay address is disqualifying on the LAN and required on the
+		// tailnet, so this is the substrate's call rather than a flat rule.
+		if !substrate.IsTailscale() && isCGNAT(nodeIP) {
+			return fmt.Errorf("host %s node IP %s is in the Tailscale/CGNAT range 100.64.0.0/10; Flannel's endpoint must be a physical address, not an overlay one (set cluster.network_substrate: %q to use the tailnet deliberately)",
+				h.Hostname, nodeIP, SubstrateTailscale)
 		}
 		if other, dup := seen[nodeIP]; dup {
 			return fmt.Errorf("hosts %s and %s share node IP %s; each node's Flannel endpoint must be exclusively its own",
